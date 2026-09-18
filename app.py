@@ -1118,6 +1118,7 @@ app = Dash(
     serve_locally=True,
     suppress_callback_exceptions=True,
     title="DMB Performance Dashboard",
+    update_title=None,
 )
 
 server = app.server
@@ -1165,17 +1166,17 @@ app.index_string = """
 # REUSABLE COMPONENTS
 # =========================================================
 
-def insight_card(title, content_id, count_id, card_class):
+def insight_card(title, content_id, count_id, card_class, initial_content=None, initial_count=0):
     return html.Div(
         [
             html.Div(
                 [
                     html.H3(title),
-                    html.Span(id=count_id, className="insight-count"),
+                    html.Span(str(initial_count), id=count_id, className="insight-count"),
                 ],
                 className="insight-title-row",
             ),
-            html.Div(id=content_id),
+            html.Div(initial_content, id=content_id),
         ],
         className=f"insight-card {card_class}",
     )
@@ -1191,9 +1192,10 @@ def insight_list(items, empty_text):
     )
 
 
-def kpi_card(label, value_id, value_color, secondary_id=None):
+def kpi_card(label, value_id, value_color, initial_value="", secondary_id=None, initial_secondary=None):
     value_children = [
         html.Span(
+            str(initial_value),
             id=value_id,
             className="kpi-card-value",
             style={"color": value_color},
@@ -1202,7 +1204,11 @@ def kpi_card(label, value_id, value_color, secondary_id=None):
 
     if secondary_id:
         value_children.append(
-            html.Span(id=secondary_id, className="kpi-card-secondary")
+            html.Span(
+                str(initial_secondary) if initial_secondary is not None else "",
+                id=secondary_id,
+                className="kpi-card-secondary",
+            )
         )
 
     return html.Div(
@@ -3101,6 +3107,152 @@ def create_trend_chart(selected_month):
 
 
 # =========================================================
+# ULTRA-FAST IN-MEMORY CACHING & PRECOMPUTATION
+# =========================================================
+
+_memo_cache = {}
+_cached_signature = None
+
+
+def get_current_data_sig():
+    try:
+        return data_folder_signature()
+    except Exception:
+        return None
+
+
+def memoize_by_data_signature(func):
+    def wrapper(*args):
+        global _cached_signature, _memo_cache
+        current_sig = get_current_data_sig()
+        if _cached_signature != current_sig:
+            _memo_cache.clear()
+            _cached_signature = current_sig
+
+        cache_key = (func.__name__, args)
+        if cache_key in _memo_cache:
+            return _memo_cache[cache_key]
+
+        result = func(*args)
+        _memo_cache[cache_key] = result
+        return result
+
+    return wrapper
+
+
+@memoize_by_data_signature
+def get_mpr_dashboard_content(month_value):
+    mpr_data = get_active_mpr_data()
+    selected_month = pd.Timestamp(month_value)
+    current = mpr_data[mpr_data["month"].eq(selected_month)].copy()
+    summary = get_month_summary(mpr_data, selected_month)
+
+    highlight_text, lowlight_text, concern_text = get_strategic_executive_insights(selected_month)
+
+    return (
+        summary["total_kpis"],
+        summary["met"],
+        summary["not_met"],
+        summary["improved"],
+        summary["neither"],
+        create_gauge(summary["performance_percentage"]),
+        create_imperative_chart(current),
+        selected_month.strftime("%B %Y"),
+        create_trend_chart(selected_month),
+        selected_month.strftime("%B %Y"),
+        insight_list(
+            highlight_text,
+            "No positive movement identified.",
+        ),
+        len(highlight_text),
+        insight_list(
+            lowlight_text,
+            "No negative movement identified.",
+        ),
+        len(lowlight_text),
+        insight_list(
+            concern_text,
+            "No continuous-red KPI identified.",
+        ),
+        len(concern_text),
+    )
+
+
+@memoize_by_data_signature
+def get_dmb_function_cards_content(month_value):
+    dmb_data = get_active_dmb_data()
+    selected_month = pd.Timestamp(month_value)
+    current = dmb_data[dmb_data["month"].eq(selected_month)].copy()
+
+    ordered_functions = list(FUNCTION_ORDER)
+
+    available_functions = [
+        f for f in current["function"].dropna().unique().tolist()
+        if str(f).strip().lower() not in EXCLUDED_DMB_FUNCTIONS
+    ]
+
+    for function_name in available_functions:
+        if function_name not in ordered_functions:
+            ordered_functions.append(function_name)
+
+    if not ordered_functions:
+        return html.P(
+            "No function-wise KPI data is available for this month.",
+            className="function-empty-message",
+        )
+
+    return [
+        create_function_card(function_name, current)
+        for function_name in ordered_functions
+    ]
+
+
+@memoize_by_data_signature
+def get_rca_table_content(month_value):
+    selected_month = pd.Timestamp(month_value)
+    return (
+        create_rca_table(selected_month),
+        selected_month.strftime("%B %Y"),
+    )
+
+
+@memoize_by_data_signature
+def get_continuous_red_modal_content(function_name, month_value):
+    selected_month = pd.Timestamp(month_value)
+    return (
+        "continuous-red-modal",
+        f"{function_name} — Root Cause Analysis",
+        selected_month.strftime("%B %Y"),
+        create_continuous_red_detail(
+            function_name,
+            selected_month,
+        ),
+    )
+
+
+def warmup_cache():
+    try:
+        active_mpr = get_active_mpr_data()
+        active_dmb = get_active_dmb_data()
+        active_strat = get_active_rca_actions()
+        mpr_months, _ = get_dynamic_reporting_months(active_mpr, active_strat)
+        dmb_months, _ = get_dynamic_reporting_months(active_dmb, active_strat)
+        all_months = sorted(set(mpr_months + dmb_months))
+        for m in all_months:
+            m_str = m.strftime("%Y-%m-%d")
+            get_mpr_dashboard_content(m_str)
+            get_dmb_function_cards_content(m_str)
+            get_rca_table_content(m_str)
+            for fn in ["Quality", "Regulatory", "ISC & Procurement", "R&D", "Customer Service", "Marketing"]:
+                get_continuous_red_modal_content(fn, m_str)
+    except Exception as e:
+        print(f"[Cache Warmup Notice] {e}")
+
+
+threading.Thread(target=warmup_cache, daemon=True).start()
+
+
+# =========================================================
 # DASHBOARD LAYOUT
 # =========================================================
 
@@ -3111,6 +3263,13 @@ def serve_layout():
 
     curr_mpr_months, curr_default_mpr_month = get_dynamic_reporting_months(active_mpr, active_strat)
     curr_dmb_months, curr_default_dmb_month = get_dynamic_reporting_months(active_dmb, active_strat)
+
+    mpr_str = curr_default_mpr_month.strftime("%Y-%m-%d")
+    dmb_str = curr_default_dmb_month.strftime("%Y-%m-%d")
+
+    mpr_init = get_mpr_dashboard_content(mpr_str)
+    dmb_init_cards = get_dmb_function_cards_content(dmb_str)
+    rca_init_table, rca_init_month = get_rca_table_content(mpr_str)
 
     return html.Div(
         [
@@ -3134,6 +3293,7 @@ def serve_layout():
                             html.A(
                                 "MPR",
                                 href="#mpr-section",
+                                id="nav-tab-mpr",
                                 className=(
                                     "navigation-tab navigation-tab-active"
                                 ),
@@ -3141,6 +3301,7 @@ def serve_layout():
                             html.A(
                                 "DMB",
                                 href="#dmb-section",
+                                id="nav-tab-dmb",
                                 className="navigation-tab",
                             ),
                         ],
@@ -3157,7 +3318,7 @@ def serve_layout():
                 className="top-navigation",
             ),
             dcc.Store(id="one-pager-download-state"),
-            dcc.Interval(id="live-sync-interval", interval=3600000, n_intervals=0),
+            dcc.Interval(id="live-sync-interval", interval=60000, n_intervals=0),
             dcc.Store(id="live-sync-state-store"),
             html.Section(
                 [
@@ -3167,6 +3328,7 @@ def serve_layout():
                                 "Highlights & Lowlights of KPIs at MoS Level"
                             ),
                             html.Span(
+                                mpr_init[9],
                                 id="insights-reporting-month",
                                 className="insights-month",
                             ),
@@ -3180,18 +3342,24 @@ def serve_layout():
                                 "highlights-content",
                                 "highlights-count",
                                 "highlight-card",
+                                initial_content=mpr_init[10],
+                                initial_count=mpr_init[11],
                             ),
                             insight_card(
                                 "Lowlights",
                                 "lowlights-content",
                                 "lowlights-count",
                                 "lowlight-card",
+                                initial_content=mpr_init[12],
+                                initial_count=mpr_init[13],
                             ),
                             insight_card(
                                 "Concerns",
                                 "concerns-content",
                                 "concerns-count",
                                 "concern-card",
+                                initial_content=mpr_init[14],
+                                initial_count=mpr_init[15],
                             ),
                         ],
                         className="executive-insights",
@@ -3209,7 +3377,7 @@ def serve_layout():
                         "MPR month",
                         "mpr-month-filter",
                         create_month_options(curr_mpr_months),
-                        default_value=curr_default_mpr_month.strftime("%Y-%m-%d"),
+                        default_value=mpr_str,
                     ),
                     html.Div(
                         [
@@ -3219,16 +3387,19 @@ def serve_layout():
                                         "Critical KPIs",
                                         "mpr-total-kpis",
                                         "#082d4c",
+                                        initial_value=mpr_init[0],
                                     ),
                                     kpi_card(
                                         "KPIs met",
                                         "mpr-met-kpis",
                                         "#168b69",
+                                        initial_value=mpr_init[1],
                                     ),
                                     kpi_card(
                                         "KPIs not met",
                                         "mpr-not-met-kpis",
                                         "#dc3d56",
+                                        initial_value=mpr_init[2],
                                     ),
                                 ],
                                 className="kpi-summary-group kpi-summary-group-3",
@@ -3239,11 +3410,13 @@ def serve_layout():
                                         "KPIs improved",
                                         "mpr-improved-kpis",
                                         "#c18100",
+                                        initial_value=mpr_init[3],
                                     ),
                                     kpi_card(
                                         "Neither improved nor met",
                                         "mpr-neither-kpis",
                                         "#dc3d56",
+                                        initial_value=mpr_init[4],
                                     ),
                                 ],
                                 className="kpi-summary-group kpi-summary-group-2",
@@ -3267,6 +3440,7 @@ def serve_layout():
                                     ),
                                     dcc.Graph(
                                         id="mpr-gauge",
+                                        figure=mpr_init[5],
                                         config={"displayModeBar": False},
                                     ),
                                 ],
@@ -3280,6 +3454,7 @@ def serve_layout():
                                                 "Strategic imperative performance"
                                             ),
                                             html.Span(
+                                                mpr_init[7],
                                                 id="imperative-month",
                                                 className="chart-note",
                                             ),
@@ -3288,6 +3463,7 @@ def serve_layout():
                                     ),
                                     dcc.Graph(
                                         id="mpr-imperative-chart",
+                                        figure=mpr_init[6],
                                         config={
                                             "displayModeBar": False,
                                             "scrollZoom": False,
@@ -3306,6 +3482,7 @@ def serve_layout():
                                     ),
                                     dcc.Graph(
                                         id="mpr-trend-chart",
+                                        figure=mpr_init[8],
                                         config={"displayModeBar": False},
                                     ),
                                 ],
@@ -3326,7 +3503,7 @@ def serve_layout():
                         "DMB month",
                         "dmb-month-filter",
                         create_month_options(curr_dmb_months),
-                        default_value=curr_default_dmb_month.strftime("%Y-%m-%d"),
+                        default_value=dmb_str,
                     ),
                     html.Div(
                         [
@@ -3361,6 +3538,7 @@ def serve_layout():
                         className="dmb-legend",
                     ),
                     html.Div(
+                        dmb_init_cards,
                         id="function-cards-container",
                         className="function-grid",
                     ),
@@ -3375,13 +3553,17 @@ def serve_layout():
                                 "Cause and Actions of Red KPIs at MoS Level"
                             ),
                             html.Span(
+                                rca_init_month,
                                 id="rca-reporting-month",
                                 className="rca-month",
                             ),
                         ],
                         className="rca-title-bar",
                     ),
-                    html.Div(id="rca-table-container"),
+                    html.Div(
+                        rca_init_table,
+                        id="rca-table-container",
+                    ),
                 ],
                 id="rca-section",
                 className="rca-section",
@@ -3455,13 +3637,10 @@ app.layout = serve_layout
 @app.callback(
     Output("live-sync-state-store", "data"),
     Input("live-sync-interval", "n_intervals"),
-    prevent_initial_call=False,
+    prevent_initial_call=True,
 )
 def handle_live_sync_trigger(n_intervals):
-    sync_result = sharepoint_sync.sync_now()
-    if sync_result.get("updated", False):
-        data_loader.reload_all_data(force=True)
-    return sync_result
+    return {"last_loaded": getattr(_data_store, "_last_loaded", 0.0)}
 
 
 @app.callback(
@@ -3504,45 +3683,10 @@ def refresh_month_dropdown_options(sync_data):
     Output("concerns-count", "children"),
     Input("mpr-month-filter", "value"),
     Input("live-sync-state-store", "data"),
+    prevent_initial_call=True,
 )
 def update_mpr_dashboard(month_value, sync_data):
-    mpr_data = get_active_mpr_data()
-    selected_month = pd.Timestamp(month_value)
-    current = mpr_data[mpr_data["month"].eq(selected_month)].copy()
-    summary = get_month_summary(mpr_data, selected_month)
-
-    highlight_text, lowlight_text, concern_text = get_strategic_executive_insights(selected_month)
-
-    return (
-        summary["total_kpis"],
-        summary["met"],
-        summary["not_met"],
-        summary["improved"],
-        summary["neither"],
-        create_gauge(summary["performance_percentage"]),
-        create_imperative_chart(current),
-        selected_month.strftime("%B %Y"),
-        create_trend_chart(selected_month),
-        selected_month.strftime("%B %Y"),
-        insight_list(
-            highlight_text,
-            "No positive movement identified.",
-        ),
-        len(highlight_text),
-        insight_list(
-            lowlight_text,
-            "No negative movement identified.",
-        ),
-        len(lowlight_text),
-        insight_list(
-            concern_text,
-            "No continuous-red KPI identified.",
-        ),
-        len(concern_text),
-    )
-
-
-
+    return get_mpr_dashboard_content(month_value)
 
 
 # =========================================================
@@ -3553,33 +3697,10 @@ def update_mpr_dashboard(month_value, sync_data):
     Output("function-cards-container", "children"),
     Input("dmb-month-filter", "value"),
     Input("live-sync-state-store", "data"),
+    prevent_initial_call=True,
 )
 def update_dmb_function_cards(month_value, sync_data):
-    dmb_data = get_active_dmb_data()
-    selected_month = pd.Timestamp(month_value)
-    current = dmb_data[dmb_data["month"].eq(selected_month)].copy()
-
-    ordered_functions = list(FUNCTION_ORDER)
-
-    available_functions = [
-        f for f in current["function"].dropna().unique().tolist()
-        if str(f).strip().lower() not in EXCLUDED_DMB_FUNCTIONS
-    ]
-
-    for function_name in available_functions:
-        if function_name not in ordered_functions:
-            ordered_functions.append(function_name)
-
-    if not ordered_functions:
-        return html.P(
-            "No function-wise KPI data is available for this month.",
-            className="function-empty-message",
-        )
-
-    return [
-        create_function_card(function_name, current)
-        for function_name in ordered_functions
-    ]
+    return get_dmb_function_cards_content(month_value)
 
 
 @app.callback(
@@ -3587,13 +3708,10 @@ def update_dmb_function_cards(month_value, sync_data):
     Output("rca-reporting-month", "children"),
     Input("mpr-month-filter", "value"),
     Input("live-sync-state-store", "data"),
+    prevent_initial_call=True,
 )
 def update_rca_table(month_value, sync_data):
-    selected_month = pd.Timestamp(month_value)
-    return (
-        create_rca_table(selected_month),
-        selected_month.strftime("%B %Y"),
-    )
+    return get_rca_table_content(month_value)
 
 
 app.clientside_callback(
@@ -3635,7 +3753,6 @@ app.clientside_callback(
     Input({"type": "modal-rca-kpi-pill", "target": ALL}, "n_clicks"),
     prevent_initial_call=True,
 )
-
 
 
 # =========================================================
@@ -3695,17 +3812,7 @@ def toggle_continuous_red_modal(
         )
 
     function_name = triggered_id.get("function", "")
-    selected_month = pd.Timestamp(month_value)
-
-    return (
-        "continuous-red-modal",
-        f"{function_name} — Root Cause Analysis",
-        selected_month.strftime("%B %Y"),
-        create_continuous_red_detail(
-            function_name,
-            selected_month,
-        ),
-    )
+    return get_continuous_red_modal_content(function_name, month_value)
 
 
 # =========================================================
