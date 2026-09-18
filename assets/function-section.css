@@ -121,7 +121,7 @@
     display: flex;
     width: calc(100% - 28px);
     height: 30px;
-    margin: 0 14px;
+    margin: 0 14px 12px;
     overflow: hidden;
     border-radius: 7px;
     background: #dce6ed;
@@ -199,7 +199,7 @@
     display: grid;
     grid-template-columns: 1.25fr 0.75fr;
     gap: 9px;
-    padding: 12px 14px 14px;
+    padding: 0 14px 14px;
 }
 
 .view-function-button {

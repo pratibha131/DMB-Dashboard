@@ -53,8 +53,8 @@ def prepare_kpi_data(data, entity_columns):
         .str.lower()
     )
 
-    higher_better = metric_nature.eq("higher the better")
-    lower_better = metric_nature.eq("lower the better")
+    lower_better = metric_nature.str.contains("lower")
+    higher_better = ~lower_better
 
     valid_values = (
         prepared["Actual"].notna()
@@ -112,39 +112,30 @@ def prepare_kpi_data(data, entity_columns):
         & prepared["previous_actual"].notna()
     )
 
+    act_rounded = prepared["Actual"].round(3)
+    prev_rounded = prepared["previous_actual"].round(3)
+
     improved = (
         (
             higher_better
-            & (
-                prepared["Actual"]
-                > prepared["previous_actual"]
-            )
+            & (act_rounded > prev_rounded)
         )
         |
         (
             lower_better
-            & (
-                prepared["Actual"]
-                < prepared["previous_actual"]
-            )
+            & (act_rounded < prev_rounded)
         )
     )
 
     declined = (
         (
             higher_better
-            & (
-                prepared["Actual"]
-                < prepared["previous_actual"]
-            )
+            & (act_rounded < prev_rounded)
         )
         |
         (
             lower_better
-            & (
-                prepared["Actual"]
-                > prepared["previous_actual"]
-            )
+            & (act_rounded > prev_rounded)
         )
     )
 

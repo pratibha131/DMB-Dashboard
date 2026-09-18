@@ -1,0 +1,35 @@
+{
+  "sync_enabled": true,
+  "poll_interval_seconds": 3600,
+  "sync_mode": "auto",
+  "local_synced_folder": "C:/Users/320320898/OneDrive - Philips",
+  "sharepoint_urls": {
+    "masterfile": "",
+    "functional_review": "",
+    "strategic_execution": ""
+  },
+  "auth": {
+    "tenant_id": "",
+    "client_id": "",
+    "client_secret": ""
+  },
+  "file_match_patterns": {
+    "masterfile": [
+      "*Masterfile*.xlsx",
+      "*DMB-Mastersheet*.xlsx",
+      "*Master*.xlsx"
+    ],
+    "functional_review": [
+      "*17th*sept*.xlsx",
+      "*17Th*sept*.xlsx",
+      "*Functional DMB Review Sheets-17th_sept*.xlsx"
+    ],
+    "strategic_execution": [
+      "*Strategic*17Th*sept*.xlsx",
+      "*Strategic*17th*sept*.xlsx",
+      "*Strategic*Execution*.xlsx",
+      "*Strategic*.xlsx",
+      "*AOP*Critical*.xlsx"
+    ]
+  }
+}

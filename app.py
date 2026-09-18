@@ -1,7 +1,9 @@
 import os
 from pathlib import Path
 from datetime import date, datetime
+from io import BytesIO
 import re
+import threading
 from zipfile import BadZipFile
 
 from dash import ALL, Dash, Input, Output, State, ctx, dcc, html, no_update
@@ -10,7 +12,7 @@ from openpyxl.utils.exceptions import InvalidFileException
 import pandas as pd
 import plotly.graph_objects as go
 
-from data_loader import load_dashboard_data
+from data_loader import load_dashboard_data, load_strategic_rca_actions
 from kpi_calculations import (
     get_default_reporting_month,
     get_month_summary,
@@ -82,23 +84,33 @@ MASTERFILE_PATH = find_masterfile()
 
 
 # =========================================================
-# LOAD AND PREPARE DATA
+# LOAD AND PREPARE DATA (DYNAMIC DATA STORE)
 # =========================================================
 
-mpr_raw, dmb_raw = load_dashboard_data(MASTERFILE_PATH)
+import sharepoint_sync
+import data_loader
 
-mpr_data = prepare_kpi_data(
-    mpr_raw,
-    ["strategic_imperative", "kpi_name"],
-)
+_data_store = data_loader.get_data_store()
+_data_store.reload()
 
-dmb_data = prepare_kpi_data(
-    dmb_raw,
-    ["function", "kpi_name"],
-)
+
+def get_active_mpr_data():
+    return _data_store.get_mpr_data()
+
+
+def get_active_dmb_data():
+    return _data_store.get_dmb_data()
+
+
+def get_active_strat_rca():
+    return _data_store.get_strat_rca()
 
 
 def load_rca_actions():
+    strat_actions = load_strategic_rca_actions()
+    if not strat_actions.empty:
+        return strat_actions
+
     required_columns = [
         "reporting_month",
         "strategic_imperative",
@@ -107,16 +119,17 @@ def load_rca_actions():
         "action",
     ]
 
-    if not MASTERFILE_PATH.exists():
+    masterfile = find_masterfile()
+    if not masterfile or not masterfile.exists():
         return pd.DataFrame(columns=required_columns)
 
     try:
         actions = pd.read_excel(
-            MASTERFILE_PATH,
+            masterfile,
             sheet_name="RCA Actions",
             engine="openpyxl",
         )
-    except ValueError:
+    except Exception:
         return pd.DataFrame(columns=required_columns)
 
     column_lookup = {
@@ -146,7 +159,13 @@ def load_rca_actions():
     return actions
 
 
-rca_actions = load_rca_actions()
+def get_active_rca_actions():
+    return load_rca_actions()
+
+
+mpr_data = get_active_mpr_data()
+dmb_data = get_active_dmb_data()
+rca_actions = get_active_rca_actions()
 
 
 # =========================================================
@@ -204,7 +223,9 @@ def kpi_key(value):
         "cp percent",
     }:
         return "cp"
-    if "sales" in normalized:
+    # Only plain sales KPIs share the key; "Sales tool delivery" and
+    # "Sales Training" are different KPIs.
+    if normalized in {"sales", "cs sales"}:
         return "sales"
 
     return normalized
@@ -226,10 +247,61 @@ def dashboard_function_name(sheet_name):
     )
 
 
-def get_visible_rca_sheets(file_path):
+def read_workbook_bytes(file_path):
+    """
+    Read a workbook even while it is open in Excel.
+
+    Excel keeps an open workbook's handle with delete access, so Windows
+    refuses a normal open() (which does not share delete access) with
+    "Permission denied". Opening with full sharing reads the last saved copy.
+    """
+    if os.name != "nt":
+        return Path(file_path).read_bytes()
+
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    create_file.restype = wintypes.HANDLE
+
+    generic_read = 0x80000000
+    share_read_write_delete = 0x7
+    open_existing = 3
+    normal_attributes = 0x80
+
+    handle = create_file(
+        str(file_path),
+        generic_read,
+        share_read_write_delete,
+        None,
+        open_existing,
+        normal_attributes,
+        None,
+    )
+    if handle is None or handle == wintypes.HANDLE(-1).value:
+        error_code = ctypes.get_last_error()
+        raise ctypes.WinError(error_code)
+
+    file_descriptor = msvcrt.open_osfhandle(handle, os.O_RDONLY)
+    with open(file_descriptor, "rb") as workbook_file:
+        return workbook_file.read()
+
+
+def get_visible_rca_sheets(workbook_bytes):
     try:
         workbook = load_workbook(
-            file_path,
+            BytesIO(workbook_bytes),
             read_only=True,
             data_only=True,
         )
@@ -263,7 +335,15 @@ def get_visible_rca_sheets(file_path):
 
 
 def find_detail_workbook():
+    """
+    Return (workbook path, its visible RCA sheets, its contents, workbooks
+    that could not be read because they were locked).
+    """
     data_directory = BASE_DIR / "data"
+
+    preferred_candidates = [
+        data_directory / "Functional DMB Review Sheets-17th_sept.xlsx",
+    ]
 
     candidates = sorted(
         file_path
@@ -272,25 +352,57 @@ def find_detail_workbook():
         and file_path != MASTERFILE_PATH
     )
 
+    for pref in reversed(preferred_candidates):
+        if pref.exists() and pref in candidates:
+            candidates.remove(pref)
+            candidates.insert(0, pref)
+
     # Select the workbook with the greatest number of visible RCA sheets.
     # This makes the multi-function review workbook take precedence over an
     # older single-sheet Book1.xlsx if both files remain in the data folder.
     ranked_candidates = []
+    locked_files = []
     for file_path in candidates:
-        rca_sheets = get_visible_rca_sheets(file_path)
+        try:
+            workbook_bytes = read_workbook_bytes(file_path)
+        except PermissionError:
+            locked_files.append(file_path)
+            continue
+        except OSError:
+            continue
+
+        rca_sheets = get_visible_rca_sheets(workbook_bytes)
         if rca_sheets:
+            # Prefer the current review workbook over older copies in data/.
+            is_pref = 1 if file_path in preferred_candidates else 0
             ranked_candidates.append(
                 (
+                    is_pref,
                     len(rca_sheets),
                     file_path.stat().st_mtime,
                     file_path,
+                    rca_sheets,
+                    workbook_bytes,
                 )
             )
 
     if ranked_candidates:
-        return max(ranked_candidates)[2]
+        _, _, _, detail_file, rca_sheets, workbook_bytes = max(
+            ranked_candidates,
+            key=lambda candidate: candidate[:3],
+        )
+        return detail_file, rca_sheets, workbook_bytes, locked_files
 
-    return data_directory / "Functional DMB Review Sheets-10th_Sept.xlsx"
+    return None, [], None, locked_files
+
+
+def locked_workbook_message(file_paths):
+    names = ", ".join(file_path.name for file_path in file_paths)
+    return (
+        f"{names} could not be read because another program is locking it "
+        "(for example OneDrive sync). Wait a moment, then click the card "
+        "again."
+    )
 
 
 def format_due_date(value):
@@ -375,6 +487,222 @@ def action_status_class(status):
     }.get(status, "action-status-unknown")
 
 
+KPI_NAME_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "at",
+    "by",
+    "for",
+    "in",
+    "is",
+    "of",
+    "on",
+    "per",
+    "the",
+    "to",
+    "vs",
+    "with",
+}
+
+
+def kpi_name_tokens(value):
+    return {
+        token
+        for token in function_key(value).split()
+        if token not in KPI_NAME_STOPWORDS
+    }
+
+
+def kpi_names_match(first_name, second_name):
+    # The KPI data, root-cause tables and action trackers name the same KPI
+    # differently (for example "OOH %", "OOH%" and "OOH% to revunue in Qtr.").
+    # Names match when their keys agree or one name's words contain the other's.
+    first_key = kpi_key(first_name)
+    if first_key and first_key == kpi_key(second_name):
+        return True
+
+    first_tokens = kpi_name_tokens(first_name)
+    second_tokens = kpi_name_tokens(second_name)
+    if not first_tokens or not second_tokens:
+        return False
+
+    return first_tokens <= second_tokens or second_tokens <= first_tokens
+
+
+def kpi_match_score(first_name, second_name):
+    """2 = same KPI key, 1 = one name's words contain the other's, 0 = no match."""
+    first_key = kpi_key(first_name)
+    if first_key and first_key == kpi_key(second_name):
+        return 2
+    if kpi_names_match(first_name, second_name):
+        return 1
+    return 0
+
+
+def assign_to_best_match(item_names, target_aliases):
+    """
+    Map each item index to the target indexes it matches best, so "Inventory"
+    goes to the "Inventory" KPI rather than also to "Market Inventory".
+    """
+    assignments = {}
+    for item_index, item_name in enumerate(item_names):
+        scores = [
+            max(
+                (kpi_match_score(item_name, alias) for alias in aliases),
+                default=0,
+            )
+            for aliases in target_aliases
+        ]
+        best_score = max(scores, default=0)
+        if best_score:
+            assignments[item_index] = [
+                target_index
+                for target_index, score in enumerate(scores)
+                if score == best_score
+            ]
+    return assignments
+
+
+MONTH_TAG_PATTERN = re.compile(
+    r"\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|"
+    r"jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|"
+    r"dec(?:ember)?)[\s'’-]*(2\d|20\d{2})\b",
+    re.IGNORECASE,
+)
+
+
+def name_applies_to_month(kpi_name, month):
+    """
+    RCA entries such as "Product Change assessment (Apr-26 & May-26)" belong
+    only to the months they name; entries without a month apply to any month.
+    """
+    tags = MONTH_TAG_PATTERN.findall(clean_cell_text(kpi_name))
+    if not tags:
+        return True
+
+    month = pd.Timestamp(month)
+    for month_text, year_text in tags:
+        year = int(year_text) if len(year_text) == 4 else 2000 + int(year_text)
+        tagged_month = pd.to_datetime(
+            f"{month_text[:3]} {year}", format="%b %Y", errors="coerce"
+        )
+        if (
+            pd.notna(tagged_month)
+            and tagged_month.year == month.year
+            and tagged_month.month == month.month
+        ):
+            return True
+    return False
+
+
+def kpi_sheet_qualifier(kpi_name, source_sheets):
+    """Return the sheet named in a KPI such as "CTB (12 weeks)(Procurement)"."""
+    for qualifier in re.findall(r"\(([^()]*)\)", clean_cell_text(kpi_name)):
+        qualifier_key = function_key(qualifier)
+        if not qualifier_key:
+            continue
+        for source_sheet in source_sheets:
+            if qualifier_key == function_key(sheet_function_name(source_sheet)):
+                return source_sheet
+    return None
+
+
+def root_cause_matches(root_cause, causes):
+    """True when an action's root cause repeats one of the given RCA causes."""
+    root_key = function_key(root_cause)
+    if len(root_key) < 12:
+        return False
+    for cause in causes:
+        cause_key = function_key(cause)
+        if len(cause_key) >= 12 and (cause_key in root_key or root_key in cause_key):
+            return True
+    return False
+
+
+def parse_review_month(value):
+    if isinstance(value, (pd.Timestamp, datetime, date)):
+        return pd.Timestamp(value).to_period("M").to_timestamp()
+
+    parsed_month = pd.to_datetime(
+        clean_cell_text(value),
+        format="%b-%Y",
+        errors="coerce",
+    )
+    if pd.isna(parsed_month):
+        return None
+
+    return parsed_month
+
+
+def parse_review_kpi_rows(raw_sheet, sheet_name):
+    """Read the monthly Target/Actual KPI block at the top of a review sheet."""
+    records = []
+    month_columns = {}
+    current_kpi = None
+
+    if raw_sheet.shape[1] < 9:
+        return records
+
+    for row_index in range(len(raw_sheet)):
+        first_cell = clean_cell_text(raw_sheet.iat[row_index, 0]).lower()
+        if first_cell.startswith(("trends", "root cause analysis")):
+            break
+
+        row_type = clean_cell_text(raw_sheet.iat[row_index, 7]).lower()
+
+        if row_type.startswith("target/"):
+            month_columns = {}
+            for column_index in range(8, min(20, raw_sheet.shape[1])):
+                month = parse_review_month(
+                    raw_sheet.iat[row_index, column_index]
+                )
+                if month is not None:
+                    month_columns[column_index] = month
+            continue
+
+        if row_type == "target":
+            # Sub-KPIs such as "Complaint rate for Z30" leave the KPI name
+            # blank and carry their name in the definition column.
+            kpi_name = clean_cell_text(
+                raw_sheet.iat[row_index, 0]
+            ) or clean_cell_text(raw_sheet.iat[row_index, 1])
+
+            current_kpi = {
+                "kpi_row": row_index,
+                "kpi_name": kpi_name,
+                "metric_nature": clean_cell_text(
+                    raw_sheet.iat[row_index, 5]
+                ),
+                "targets": {
+                    column_index: raw_sheet.iat[row_index, column_index]
+                    for column_index in month_columns
+                },
+            }
+            continue
+
+        if row_type != "actual" or current_kpi is None:
+            continue
+
+        if current_kpi["kpi_name"]:
+            for column_index, month in month_columns.items():
+                records.append(
+                    {
+                        "source_sheet": sheet_name,
+                        "kpi_row": current_kpi["kpi_row"],
+                        "kpi_name": current_kpi["kpi_name"],
+                        "metric_nature": current_kpi["metric_nature"],
+                        "month": month,
+                        "Target": current_kpi["targets"].get(column_index),
+                        "Actual": raw_sheet.iat[row_index, column_index],
+                    }
+                )
+
+        current_kpi = None
+
+    return records
+
+
 def load_function_rca_details():
     cause_columns = [
         "function",
@@ -401,39 +729,58 @@ def load_function_rca_details():
         "status",
         "status_class",
     ]
+    review_kpi_columns = [
+        "function",
+        "function_key",
+        "source_function",
+        "source_sheet",
+        "kpi_row",
+        "kpi_name",
+        "metric_nature",
+        "month",
+        "Target",
+        "Actual",
+        "status",
+    ]
 
-    detail_file = find_detail_workbook()
-    if not detail_file.exists():
-        return (
-            pd.DataFrame(columns=cause_columns),
-            pd.DataFrame(columns=action_columns),
-            detail_file,
+    (
+        detail_file,
+        visible_rca_sheets,
+        workbook_bytes,
+        locked_files,
+    ) = find_detail_workbook()
+
+    def failed_result(error):
+        print(f"[RCA Loader Notice] {error}")
+        return {
+            "causes": pd.DataFrame(columns=cause_columns),
+            "actions": pd.DataFrame(columns=action_columns),
+            "review_kpis": pd.DataFrame(columns=review_kpi_columns),
+            "file": detail_file,
+            "error": error,
+        }
+
+    if detail_file is None:
+        if locked_files:
+            return failed_result(locked_workbook_message(locked_files))
+        return failed_result(
+            "No workbook with Root Cause Analysis sheets was found in "
+            "the data folder."
         )
 
     cause_records = []
     action_records = []
-    visible_rca_sheets = get_visible_rca_sheets(detail_file)
-
-    if not visible_rca_sheets:
-        return (
-            pd.DataFrame(columns=cause_columns),
-            pd.DataFrame(columns=action_columns),
-            detail_file,
-        )
+    review_kpi_records = []
 
     try:
         worksheets = pd.read_excel(
-            detail_file,
+            BytesIO(workbook_bytes),
             sheet_name=visible_rca_sheets,
             header=None,
             engine="openpyxl",
         )
-    except (OSError, ValueError):
-        return (
-            pd.DataFrame(columns=cause_columns),
-            pd.DataFrame(columns=action_columns),
-            detail_file,
-        )
+    except (OSError, ValueError) as error:
+        return failed_result(f"{detail_file.name} could not be read: {error}")
 
     for sheet_name, raw_sheet in worksheets.items():
         source_function = sheet_function_name(sheet_name)
@@ -442,6 +789,16 @@ def load_function_rca_details():
 
         if raw_sheet.empty or raw_sheet.shape[1] < 6:
             continue
+
+        for review_kpi in parse_review_kpi_rows(raw_sheet, sheet_name):
+            review_kpi_records.append(
+                {
+                    "function": function_name,
+                    "function_key": current_function_key,
+                    "source_function": source_function,
+                    **review_kpi,
+                }
+            )
 
         first_column = raw_sheet.iloc[:, 0].map(clean_cell_text)
 
@@ -599,22 +956,133 @@ def load_function_rca_details():
     if not actions.empty:
         actions = actions.drop_duplicates().reset_index(drop=True)
 
-    return causes, actions, detail_file
+    review_kpis = pd.DataFrame(review_kpi_records)
+    if review_kpis.empty:
+        review_kpis = pd.DataFrame(columns=review_kpi_columns)
+    else:
+        review_kpis = prepare_kpi_data(
+            review_kpis,
+            ["source_sheet", "kpi_row"],
+        )[review_kpi_columns]
+
+    return {
+        "causes": causes,
+        "actions": actions,
+        "review_kpis": review_kpis,
+        "file": detail_file,
+        "error": None,
+    }
 
 
-function_rca_causes, function_rca_actions, FUNCTION_RCA_FILE = (
-    load_function_rca_details()
-)
+_function_rca_lock = threading.Lock()
+_function_rca_cache = {"signature": None, "data": None}
 
-default_month = get_default_reporting_month(dmb_data)
+
+def data_folder_signature():
+    signature = []
+    for file_path in sorted((BASE_DIR / "data").glob("*.xlsx")):
+        if file_path.name.startswith("~$"):
+            continue
+        try:
+            file_stat = file_path.stat()
+        except OSError:
+            continue
+        signature.append(
+            (file_path.name, file_stat.st_mtime_ns, file_stat.st_size)
+        )
+    return tuple(signature)
+
+
+def get_function_rca_data():
+    """
+    Return the Functional DMB Review data, re-reading the workbook when a data
+    file changes or when the previous read failed (for example because the
+    workbook was open in Excel), so no app restart is needed.
+    """
+    signature = data_folder_signature()
+
+    with _function_rca_lock:
+        cached_data = _function_rca_cache["data"]
+        if (
+            cached_data is None
+            or cached_data["error"]
+            or _function_rca_cache["signature"] != signature
+        ):
+            _function_rca_cache["data"] = load_function_rca_details()
+            _function_rca_cache["signature"] = signature
+
+        return _function_rca_cache["data"]
+
+
+get_function_rca_data()
+
+
+def get_dynamic_reporting_months(data=None, rca_actions_df=None, reference_date=None):
+    """
+    Returns (available_months, default_month) dynamically:
+    - Automatically includes all completed months from January of the year up to
+      the previous calendar month (e.g. in September 2026 -> Jan-Aug 2026;
+      when October 2026 starts -> Jan-Sep 2026 automatically).
+    - Plus any months with actual data present in the dataset.
+    - Plus any months present in strategic/functional RCA actions.
+    - Default month is the latest month among available completed months or months with actuals.
+    """
+    if reference_date is None:
+        ref_dt = pd.Timestamp.now()
+    else:
+        ref_dt = pd.Timestamp(reference_date)
+
+    current_month_start = pd.Timestamp(year=ref_dt.year, month=ref_dt.month, day=1)
+    latest_completed_month = (current_month_start - pd.DateOffset(months=1)).floor("D")
+
+    start_month = pd.Timestamp(year=ref_dt.year, month=1, day=1)
+    if data is not None and "month" in data.columns and not data["month"].dropna().empty:
+        min_m = data["month"].dropna().min()
+        if pd.notna(min_m) and pd.Timestamp(min_m) < start_month:
+            start_month = pd.Timestamp(min_m).replace(day=1)
+
+    calendar_months = set()
+    if start_month <= latest_completed_month:
+        calendar_months = set(pd.date_range(start=start_month, end=latest_completed_month, freq="MS"))
+    else:
+        calendar_months = {latest_completed_month}
+
+    data_months = set()
+    if data is not None and "month" in data.columns and "Actual" in data.columns:
+        if "Target" in data.columns:
+            actual_months = data.loc[
+                data["Actual"].notna() & data["Target"].notna(), "month"
+            ].dropna().unique()
+        else:
+            actual_months = data.loc[data["Actual"].notna(), "month"].dropna().unique()
+        data_months.update(pd.Timestamp(m).replace(day=1) for m in actual_months)
+
+    if rca_actions_df is None:
+        try:
+            rca_actions_df = get_active_rca_actions()
+        except Exception:
+            rca_actions_df = pd.DataFrame()
+
+    if rca_actions_df is not None and not rca_actions_df.empty:
+        if "actual" in rca_actions_df.columns:
+            if "target" in rca_actions_df.columns:
+                rca_actual_rows = rca_actions_df.loc[
+                    rca_actions_df["actual"].notna() & rca_actions_df["target"].notna()
+                ]
+            else:
+                rca_actual_rows = rca_actions_df.loc[rca_actions_df["actual"].notna()]
+            if not rca_actual_rows.empty and "reporting_month" in rca_actual_rows.columns:
+                rca_months = rca_actual_rows["reporting_month"].dropna().unique()
+                data_months.update(pd.Timestamp(m).replace(day=1) for m in rca_months)
+
+    all_months = sorted(calendar_months | data_months)
+    default_m = all_months[-1] if all_months else latest_completed_month
+    return all_months, default_m
 
 
 def get_available_months(data):
-    return sorted(
-        data.loc[data["month"] <= default_month, "month"]
-        .dropna()
-        .unique()
-    )
+    months, _ = get_dynamic_reporting_months(data)
+    return months
 
 
 def create_month_options(months):
@@ -634,8 +1102,9 @@ def create_month_options(months):
     ]
 
 
-mpr_months = get_available_months(mpr_data)
-dmb_months = get_available_months(dmb_data)
+mpr_months, default_mpr_month = get_dynamic_reporting_months(mpr_data, rca_actions)
+dmb_months, default_dmb_month = get_dynamic_reporting_months(dmb_data, rca_actions)
+default_month = max(default_mpr_month, default_dmb_month)
 
 
 # =========================================================
@@ -717,7 +1186,7 @@ def insight_list(items, empty_text):
         return html.P(empty_text, className="empty-message")
 
     return html.Ul(
-        [html.Li(item) for item in items[:INSIGHT_DISPLAY_LIMIT]],
+        [html.Li(item) for item in items],
         className="insight-list",
     )
 
@@ -752,7 +1221,13 @@ def section_header(
     filter_label,
     filter_id,
     filter_options,
+    default_value=None,
 ):
+    if default_value is None and filter_options:
+        default_value = filter_options[-1]["value"]
+    elif default_value is None:
+        default_value = default_month.strftime("%Y-%m-%d")
+
     return html.Div(
         [
             html.Div([html.H2(title), html.P(subtitle)]),
@@ -762,7 +1237,7 @@ def section_header(
                     dcc.Dropdown(
                         id=filter_id,
                         options=filter_options,
-                        value=default_month.strftime("%Y-%m-%d"),
+                        value=default_value,
                         clearable=False,
                         searchable=False,
                         optionHeight=40,
@@ -875,19 +1350,19 @@ FUNCTION_ORDER = [
     "ISC & Procurement",
     "Regulatory",
     "R&D",
-    "NAR",
-    "Europe",
-    "Growth",
 ]
+EXCLUDED_DMB_FUNCTIONS = {"nar", "europe", "growth"}
 
 
 def create_mini_gauge(value):
-    gauge_color = "#168b69" if value >= GAUGE_TARGET else "#dc3d56"
+    is_no_data = value is None or pd.isna(value)
+    numeric_value = 0 if is_no_data else value
+    gauge_color = "#dce7ef" if is_no_data else ("#168b69" if numeric_value >= GAUGE_TARGET else "#dc3d56")
 
     figure = go.Figure(
         go.Indicator(
             mode="gauge",
-            value=value,
+            value=numeric_value,
             domain={"x": [0.08, 0.92], "y": [0.04, 1.0]},
             gauge={
                 "shape": "angular",
@@ -927,10 +1402,11 @@ def create_mini_gauge(value):
         )
     )
 
+    display_text = "<b>—</b>" if is_no_data else f"<b>{value:.1f}%</b>"
     figure.add_annotation(
         x=0.5,
         y=0.34,
-        text=f"<b>{value:.1f}%</b>",
+        text=display_text,
         showarrow=False,
         font={
             "family": "Segoe UI",
@@ -961,92 +1437,24 @@ def create_mini_gauge(value):
     return figure
 
 
-def create_rca_table(selected_month):
-    monthly_actions = rca_actions[
-        rca_actions["reporting_month"].eq(pd.Timestamp(selected_month))
-    ].copy()
-
-    if monthly_actions.empty:
-        return html.Div(
-            [
-                html.Strong("RCA Actions data was not found."),
-                html.Span(
-                    " Use the updated masterfile containing the RCA Actions tab."
-                ),
-            ],
-            className="rca-empty-message",
-        )
-
-    for column in [
-        "strategic_imperative",
-        "kpi_name",
-        "cause",
-        "action",
-    ]:
-        monthly_actions[column] = monthly_actions[column].fillna("").map(
-            lambda value: str(value).strip()
-        )
-
-    # Only completed RCA rows appear in the management table.
-    monthly_actions = monthly_actions[
-        monthly_actions["kpi_name"].ne("")
-        & monthly_actions["cause"].ne("")
-        & monthly_actions["action"].ne("")
-    ].drop_duplicates(
-        ["strategic_imperative", "kpi_name"],
-        keep="last",
-    )
-
-    if monthly_actions.empty:
-        return html.Div(
-            "No completed cause and action entry is available for this month.",
-            className="rca-empty-message",
-        )
-
-    table_rows = []
-
-    for _, row in monthly_actions.iterrows():
-        table_rows.append(
-            html.Tr(
-                [
-                    html.Td(row["strategic_imperative"]),
-                    html.Td(row["kpi_name"], className="rca-kpi-name"),
-                    html.Td(row["cause"]),
-                    html.Td(row["action"]),
-                ]
-            )
-        )
-
-    return html.Div(
-        html.Table(
-            [
-                html.Thead(
-                    html.Tr(
-                        [
-                            html.Th("Strategic Imperatives"),
-                            html.Th("KPI Name"),
-                            html.Th("Cause"),
-                            html.Th("Action"),
-                        ]
-                    )
-                ),
-                html.Tbody(table_rows),
-            ],
-            className="rca-table",
-        ),
-        className="rca-table-wrap",
-    )
+# RCA Table rendering is defined after create_cause_table below.
 
 
 def create_function_card(function_name, current_data):
-    function_rows = current_data[
-        current_data["function"].eq(function_name)
-    ].copy()
+    function_rows = (
+        current_data[current_data["function"].eq(function_name)].copy()
+        if not current_data.empty and "function" in current_data.columns
+        else pd.DataFrame()
+    )
 
-    valid = function_rows[
-        function_rows["Actual"].notna()
-        & function_rows["Target"].notna()
-    ].copy()
+    valid = (
+        function_rows[
+            function_rows["Actual"].notna()
+            & function_rows["Target"].notna()
+        ].copy()
+        if not function_rows.empty
+        else pd.DataFrame()
+    )
 
     if valid.empty:
         return html.Div(
@@ -1054,13 +1462,66 @@ def create_function_card(function_name, current_data):
                 html.Div(
                     [
                         html.H3(function_name),
-                        html.Span("No data", className="function-no-data-badge"),
+                        html.Span("—", className="function-movement movement-neutral"),
                     ],
                     className="function-card-header",
                 ),
                 html.P(
-                    "No target and actual values are available for this month.",
-                    className="function-empty-message",
+                    "Core & enabling KPI performance",
+                    className="function-card-subtitle",
+                ),
+                html.Div(
+                    [
+                        html.Div(
+                            "0",
+                            className="function-bar-met",
+                            style={"width": "100%", "background": "#dce6ed", "color": "#768b9c"},
+                        ),
+                    ],
+                    className="function-stacked-bar",
+                ),
+                html.Div(
+                    [
+                        html.Div(
+                            [
+                                html.Div(
+                                    [
+                                        html.Span("Met & improved"),
+                                        html.Span(
+                                            f"Target {GAUGE_TARGET}%",
+                                            className="mini-target-label",
+                                        ),
+                                    ],
+                                    className="mini-gauge-title",
+                                ),
+                                dcc.Graph(
+                                    figure=create_mini_gauge(None),
+                                    config={"displayModeBar": False},
+                                    className="mini-gauge-graph",
+                                ),
+                            ],
+                            className="mini-gauge-container",
+                        ),
+                        html.Button(
+                            [
+                                html.Span(
+                                    "0",
+                                    className="continuous-red-value no-red-value",
+                                ),
+                                html.P("Red KPIs"),
+                                html.Small("No red KPI"),
+                            ],
+                            id={
+                                "type": "continuous-red-card",
+                                "function": function_name,
+                            },
+                            n_clicks=0,
+                            disabled=True,
+                            title="No data available for this function in this month",
+                            className="continuous-red-panel",
+                        ),
+                    ],
+                    className="function-card-bottom",
                 ),
             ],
             className="function-card",
@@ -1134,39 +1595,6 @@ def create_function_card(function_name, current_data):
                 [
                     html.Div(
                         [
-                            html.Strong(str(total)),
-                            html.Span("Reported"),
-                        ],
-                        className="function-stat",
-                    ),
-                    html.Div(
-                        [
-                            html.Strong(str(met), className="stat-green"),
-                            html.Span("Met"),
-                        ],
-                        className="function-stat",
-                    ),
-                    html.Div(
-                        [
-                            html.Strong(str(not_met), className="stat-red"),
-                            html.Span("Not met"),
-                        ],
-                        className="function-stat",
-                    ),
-                    html.Div(
-                        [
-                            html.Strong(str(improved), className="stat-amber"),
-                            html.Span("Improved"),
-                        ],
-                        className="function-stat",
-                    ),
-                ],
-                className="function-stat-grid",
-            ),
-            html.Div(
-                [
-                    html.Div(
-                        [
                             html.Div(
                                 [
                                     html.Span("Met & improved"),
@@ -1188,19 +1616,19 @@ def create_function_card(function_name, current_data):
                     html.Button(
                         [
                             html.Span(
-                                str(continuous_red),
+                                str(not_met),
                                 className=(
                                     "continuous-red-value"
-                                    if continuous_red
+                                    if not_met
                                     else "continuous-red-value no-red-value"
                                 ),
                             ),
-                            html.P("Continuous red KPIs"),
+                            html.P("Red KPIs"),
                             html.Small(
                                 (
                                     "Click to view root causes and actions"
-                                    if continuous_red
-                                    else "No KPI is red for 2 or more months"
+                                    if not_met
+                                    else "No red KPI"
                                 )
                             ),
                         ],
@@ -1209,15 +1637,15 @@ def create_function_card(function_name, current_data):
                             "function": function_name,
                         },
                         n_clicks=0,
-                        disabled=continuous_red == 0,
+                        disabled=not_met == 0,
                         title=(
                             "View root causes and corrective actions"
-                            if continuous_red
-                            else "No continuous-red KPI for this function"
+                            if not_met
+                            else "No red KPI for this function"
                         ),
                         className=(
                             "continuous-red-panel continuous-red-panel-active"
-                            if continuous_red
+                            if not_met
                             else "continuous-red-panel"
                         ),
                     ),
@@ -1229,92 +1657,439 @@ def create_function_card(function_name, current_data):
     )
 
 
-def create_cause_table(source_kpi_name, causes):
-    causes = causes.sort_values("cause_rank").copy()
 
-    if causes.empty:
-        return html.Div(
+
+
+
+def is_closed_action_status(status_val):
+    if not status_val or pd.isna(status_val):
+        return False
+    s = str(status_val).strip().lower()
+    return s in {
+        "action completed",
+        "resolution confirmed",
+        "completed",
+        "confirmed",
+    }
+
+
+def format_impact_badge(impact_val):
+    if impact_val is not None and pd.notna(impact_val):
+        try:
+            val_num = float(impact_val)
+            if 0 < val_num <= 1.0:
+                val_num = val_num * 100
+            txt = f"{val_num:.0f}%"
+            return html.Span(txt, className="rca-impact-pill")
+        except (ValueError, TypeError):
+            if str(impact_val).strip() and str(impact_val).strip() != "—":
+                return html.Span(str(impact_val).strip(), className="rca-impact-pill")
+    return html.Span("—", className="rca-dash-text")
+
+
+def calculate_row_spans(total_rows, count):
+    if count <= 0:
+        return []
+    base = total_rows // count
+    extra = total_rows % count
+    spans = []
+    curr = 0
+    for i in range(count):
+        span = base + (1 if i < extra else 0)
+        spans.append((curr, span))
+        curr += span
+    return spans
+
+
+def create_kpi_rca_card(
+    source_kpi_name,
+    causes,
+    actions_to_show,
+    red_kpi_name=None,
+    function_badge=None,
+    card_id=None,
+    is_red=True,
+    missing_action_text=None,
+):
+    disp_title = red_kpi_name or source_kpi_name
+    if missing_action_text is None:
+        missing_action_text = (
+            "All corrective actions completed"
+            if actions_to_show is not None and not actions_to_show.empty
+            else "No Corrective Actions provided"
+        )
+
+    # Prepare Causes DataFrame
+    if causes is not None and not causes.empty:
+        causes_df = (
+            causes.sort_values("cause_rank").copy()
+            if "cause_rank" in causes.columns
+            else causes.copy()
+        )
+    else:
+        causes_df = pd.DataFrame()
+
+    # Prepare Actions DataFrame
+    if actions_to_show is not None and not actions_to_show.empty:
+        open_actions = (
+            actions_to_show[
+                ~actions_to_show["status"].apply(is_closed_action_status)
+            ].copy()
+            if "status" in actions_to_show.columns
+            else actions_to_show.copy()
+        )
+    else:
+        open_actions = pd.DataFrame()
+
+    num_causes = len(causes_df)
+    num_actions = len(open_actions)
+    total_rows = max(1, num_causes, num_actions)
+
+    cause_spans = calculate_row_spans(total_rows, num_causes)
+    cause_map = {start: (idx, span) for idx, (start, span) in enumerate(cause_spans)}
+
+    action_spans = calculate_row_spans(total_rows, num_actions)
+    action_map = {start: (idx, span) for idx, (start, span) in enumerate(action_spans)}
+
+    # Header Row 1: Top Categories (Top Causes = 2 cols, Corrective Action = 4 cols)
+    thead_row_1 = html.Tr(
+        [
+            html.Th(
+                "Top Causes",
+                colSpan=2,
+                className="rca-group-head-causes",
+            ),
+            html.Th(
+                "Corrective Action",
+                colSpan=4,
+                className="rca-group-head-actions",
+            ),
+        ]
+    )
+
+    # Header Row 2: Sub-headers (6 columns total: Cause, Impact, Root Cause, Action Description, Owner, Status)
+    thead_row_2 = html.Tr(
+        [
+            html.Th("Cause", className="rca-subhead-cell rca-col-cause"),
+            html.Th("Impact on KPI Gap", className="rca-subhead-cell rca-col-impact"),
+            html.Th("Root Cause", className="rca-subhead-cell rca-col-root-cause"),
+            html.Th("Action Description", className="rca-subhead-cell rca-col-action-desc"),
+            html.Th("Owner", className="rca-subhead-cell rca-col-owner"),
+            html.Th("Status", className="rca-subhead-cell rca-col-status"),
+        ]
+    )
+
+    tbody_rows = []
+
+    for r_idx in range(total_rows):
+        row_cells = []
+
+        # --- Left Side: Causes (2 cells) ---
+        if num_causes == 0:
+            if r_idx == 0:
+                row_cells.append(
+                    html.Td(
+                        "No RCA provided",
+                        rowSpan=total_rows if total_rows > 1 else None,
+                        className="rca-recovery-cell rca-cause-text rca-missing-text",
+                    )
+                )
+                row_cells.append(
+                    html.Td(
+                        "—",
+                        rowSpan=total_rows if total_rows > 1 else None,
+                        className="rca-recovery-cell text-center rca-col-impact-cell rca-dash-text",
+                    )
+                )
+        elif r_idx in cause_map:
+            c_idx, c_span = cause_map[r_idx]
+            c_row = causes_df.iloc[c_idx]
+            c_text = clean_cell_text(c_row.get("cause", "")) or "—"
+            c_impact = format_impact_badge(c_row.get("impact_percent"))
+            row_cells.append(
+                html.Td(
+                    c_text,
+                    rowSpan=c_span if c_span > 1 else None,
+                    className="rca-recovery-cell rca-cause-text",
+                )
+            )
+            row_cells.append(
+                html.Td(
+                    c_impact,
+                    rowSpan=c_span if c_span > 1 else None,
+                    className="rca-recovery-cell text-center rca-col-impact-cell",
+                )
+            )
+
+        # --- Right Side: Actions (4 cells) ---
+        if num_actions == 0:
+            if r_idx == 0:
+                row_cells.append(
+                    html.Td(
+                        missing_action_text,
+                        rowSpan=total_rows if total_rows > 1 else None,
+                        colSpan=2,
+                        className="rca-recovery-cell rca-action-text rca-missing-text",
+                    )
+                )
+                row_cells.append(
+                    html.Td(
+                        "—",
+                        rowSpan=total_rows if total_rows > 1 else None,
+                        className="rca-recovery-cell text-center rca-dash-text",
+                    )
+                )
+                row_cells.append(
+                    html.Td(
+                        "—",
+                        rowSpan=total_rows if total_rows > 1 else None,
+                        className="rca-recovery-cell text-center rca-dash-text",
+                    )
+                )
+        elif r_idx in action_map:
+            a_idx, a_span = action_map[r_idx]
+            a_row = open_actions.iloc[a_idx]
+            a_desc = clean_cell_text(a_row.get("corrective_action", ""))
+            while a_desc and a_desc[0] in {";", "-", "–", "—", ":", " ", "\t"}:
+                a_desc = a_desc[1:].strip()
+
+            root_cause_str = clean_cell_text(a_row.get("root_cause", ""))
+            while root_cause_str and root_cause_str[0] in {";", "-", "–", "—", ":", " ", "\t"}:
+                root_cause_str = root_cause_str[1:].strip()
+
+            root_cause_display = (
+                root_cause_str
+                if root_cause_str and root_cause_str.lower() not in {"not entered", "none", "—", ""}
+                else "—"
+            )
+
+            a_owner = clean_cell_text(a_row.get("owner", "")) or "—"
+            a_status_text = (
+                clean_cell_text(a_row.get("status", ""))
+                or "Status not entered"
+            )
+            a_status_cls = a_row.get("status_class", "action-status-unknown")
+            a_status_pill = html.Span(
+                a_status_text,
+                className=f"action-status-pill {a_status_cls}",
+            )
+
+            row_cells.append(
+                html.Td(
+                    root_cause_display,
+                    rowSpan=a_span if a_span > 1 else None,
+                    className="rca-recovery-cell rca-root-cause-text",
+                )
+            )
+            row_cells.append(
+                html.Td(
+                    a_desc or "—",
+                    rowSpan=a_span if a_span > 1 else None,
+                    className="rca-recovery-cell rca-action-text",
+                )
+            )
+            row_cells.append(
+                html.Td(
+                    a_owner,
+                    rowSpan=a_span if a_span > 1 else None,
+                    className="rca-recovery-cell text-center rca-owner-text",
+                )
+            )
+            row_cells.append(
+                html.Td(
+                    a_status_pill,
+                    rowSpan=a_span if a_span > 1 else None,
+                    className="rca-recovery-cell text-center",
+                )
+            )
+
+        tbody_rows.append(html.Tr(row_cells, className="rca-recovery-row"))
+
+    card_kwargs = {"className": "kpi-rca-action-card"}
+    if card_id:
+        card_kwargs["id"] = card_id
+
+    header_children = [
+        html.Div(
             [
-                html.H4(source_kpi_name),
-                html.P("No root-cause data is entered for this KPI."),
+                html.Span(
+                    [
+                        html.Span(className="rca-red-badge-dot"),
+                        html.Span(
+                            "RED KPI" if is_red else "OTHER RCA",
+                            className="rca-red-kpi-badge",
+                        ),
+                    ],
+                    className=(
+                        "rca-header-badge-group"
+                        if is_red
+                        else "rca-header-badge-group rca-badge-not-red"
+                    ),
+                ),
+                html.H3(
+                    disp_title,
+                    className="rca-recovery-card-title",
+                ),
             ],
-            className="cause-table-empty",
+            className="rca-card-title-group",
+        ),
+    ]
+    if function_badge:
+        header_children.append(
+            html.Span(function_badge, className="rca-function-pill")
         )
 
-    cause_cells = []
-    impact_cells = []
+    return html.Div(
+        [
+            html.Div(
+                header_children,
+                className="rca-recovery-card-header",
+            ),
+            html.Div(
+                html.Table(
+                    [
+                        html.Thead([thead_row_1, thead_row_2]),
+                        html.Tbody(tbody_rows),
+                    ],
+                    className="rca-recovery-table",
+                ),
+                className="rca-recovery-table-wrap",
+            ),
+        ],
+        **card_kwargs,
+    )
 
-    for _, cause_row in causes.iterrows():
-        impact_value = cause_row["impact_percent"]
-        impact_text = (
-            f"{float(impact_value):.0f}%"
-            if not pd.isna(impact_value)
-            else "Not quantified"
+
+def slug_kpi_id(s):
+    return "rca-kpi-card-" + re.sub(r"[^a-zA-Z0-9_-]", "_", str(s)).lower().strip("_")
+
+
+def create_rca_table(selected_month):
+    selected_month = pd.Timestamp(selected_month)
+    rca_actions = get_active_rca_actions()
+    monthly_actions = rca_actions[
+        rca_actions["reporting_month"].eq(selected_month)
+    ].copy()
+
+    if monthly_actions.empty:
+        return html.Div(
+            f"No Red KPI cause and action entries recorded for {selected_month.strftime('%B %Y')}.",
+            className="rca-empty-message",
         )
 
-        cause_cells.append(html.Td(cause_row["cause"]))
-        impact_cells.append(html.Td(impact_text))
+    for column in [
+        "strategic_imperative",
+        "kpi_name",
+        "cause",
+        "action",
+    ]:
+        if column in monthly_actions.columns:
+            monthly_actions[column] = monthly_actions[column].fillna("").map(
+                lambda value: str(value).strip()
+            )
+        else:
+            monthly_actions[column] = ""
 
-    cause_count = len(causes)
+    # Filter for all Red KPIs in the selected month with both Target and Actual
+    if "is_red" in monthly_actions.columns:
+        monthly_actions = monthly_actions[
+            monthly_actions["is_red"]
+            & monthly_actions["kpi_name"].ne("")
+            & monthly_actions["target"].notna()
+            & monthly_actions["actual"].notna()
+        ].drop_duplicates(["strategic_imperative", "kpi_name"], keep="last")
+    else:
+        monthly_actions = monthly_actions[
+            monthly_actions["kpi_name"].ne("")
+            & monthly_actions["target"].notna()
+            & monthly_actions["actual"].notna()
+        ].drop_duplicates(["strategic_imperative", "kpi_name"], keep="last")
+
+    if monthly_actions.empty:
+        return html.Div(
+            f"No Red KPIs recorded for {selected_month.strftime('%B %Y')}.",
+            className="rca-empty-message",
+        )
+
+    # Build exact lookup maps across strategic RCA records (exact KPI name only)
+    strategic_cause_map = {}
+    strategic_action_map = {}
+
+    for _, r in rca_actions.iterrows():
+        k_name = str(r.get("kpi_name", "")).strip()
+        c_val = str(r.get("cause", "")).strip()
+        a_val = str(r.get("action", "")).strip()
+
+        c_clean = "" if (not c_val or c_val.lower() in {"—", "-", "–", "none", "nan", "null", "not entered", "na", "n/a", "no rca", "no rca provided"}) else c_val
+        a_clean = "" if (not a_val or a_val.lower() in {"—", "-", "–", "none", "nan", "null", "not entered", "na", "n/a", "no corrective actions provided", "no action", "no actions", "no actions provided"}) else a_val
+
+        if c_clean and k_name not in strategic_cause_map:
+            strategic_cause_map[k_name] = c_clean
+        if a_clean and k_name not in strategic_action_map:
+            strategic_action_map[k_name] = a_clean
+
+    table_rows = []
+
+    for _, row in monthly_actions.iterrows():
+        kpi_name_val = row["kpi_name"]
+        curr_c = str(row.get("cause", "")).strip()
+        curr_a = str(row.get("action", "")).strip()
+
+        cause_val = curr_c if (curr_c and curr_c.lower() not in {"—", "-", "–", "none", "nan", "null", "not entered", "na", "n/a", "no rca", "no rca provided"}) else strategic_cause_map.get(kpi_name_val, "")
+        action_val = curr_a if (curr_a and curr_a.lower() not in {"—", "-", "–", "none", "nan", "null", "not entered", "na", "n/a", "no corrective actions provided", "no action", "no actions", "no actions provided"}) else strategic_action_map.get(kpi_name_val, "")
+
+        is_cause_missing = (
+            not cause_val
+            or cause_val in {"—", "-", "–", "none", "nan", "null", "not entered", "na", "n/a"}
+            or cause_val.lower() in {"—", "-", "–", "none", "nan", "null", "not entered", "na", "n/a", "no rca", "no rca provided"}
+        )
+        if is_cause_missing:
+            cause_cell = html.Span("No RCA provided", className="rca-missing-text")
+        else:
+            cause_cell = html.Span(cause_val)
+
+        is_action_missing = (
+            not action_val
+            or action_val in {"—", "-", "–", "none", "nan", "null", "not entered", "na", "n/a"}
+            or action_val.lower() in {"—", "-", "–", "none", "nan", "null", "not entered", "na", "n/a", "no corrective actions provided", "no action", "no actions", "no actions provided"}
+        )
+        if is_action_missing:
+            action_cell = html.Span("No Actions Provided", className="rca-missing-text")
+        else:
+            action_cell = html.Span(action_val)
+
+        table_rows.append(
+            html.Tr(
+                [
+                    html.Td(row["strategic_imperative"], className="rca-imperative-name"),
+                    html.Td(row["kpi_name"], className="rca-kpi-name"),
+                    html.Td(cause_cell, className="rca-cause-text"),
+                    html.Td(action_cell, className="rca-action-text"),
+                ]
+            )
+        )
 
     return html.Div(
         html.Table(
             [
                 html.Thead(
-                    [
-                        html.Tr(
-                            [
-                                html.Th(
-                                    "Red KPI",
-                                    rowSpan=2,
-                                    className="cause-table-kpi-heading",
-                                ),
-                                html.Th(
-                                    "Top Causes",
-                                    colSpan=cause_count,
-                                    className="cause-table-group-heading",
-                                ),
-                            ]
-                        ),
-                        html.Tr(
-                            [
-                                html.Th(f"Cause {cause_number}")
-                                for cause_number in range(
-                                    1,
-                                    cause_count + 1,
-                                )
-                            ]
-                        ),
-                    ]
+                    html.Tr(
+                        [
+                            html.Th("Strategic Imperatives"),
+                            html.Th("KPI Name"),
+                            html.Th("Cause"),
+                            html.Th("Action"),
+                        ]
+                    )
                 ),
-                html.Tbody(
-                    [
-                        html.Tr(
-                            [
-                                html.Td(
-                                    source_kpi_name,
-                                    className="cause-table-kpi-name",
-                                ),
-                                *cause_cells,
-                            ]
-                        ),
-                        html.Tr(
-                            [
-                                html.Td(
-                                    "% impact on KPI gap",
-                                    className="cause-table-impact-label",
-                                ),
-                                *impact_cells,
-                            ],
-                            className="cause-table-impact-row",
-                        ),
-                    ]
-                ),
+                html.Tbody(table_rows),
             ],
-            className="cause-matrix-table",
+            className="rca-table",
         ),
-        className="cause-matrix-table-wrap",
+        className="rca-table-wrap",
     )
+
+
 
 
 def wrap_chart_label(value, maximum_line_length=20):
@@ -1540,90 +2315,125 @@ def create_pareto_card(source_kpi_name, causes):
     )
 
 
-def create_action_tracker_table(actions):
-    if actions.empty:
-        return html.P(
-            "No corrective actions are entered for this function.",
-            className="modal-inline-empty",
+def get_strategic_executive_insights(selected_month):
+    strat_df = get_active_strat_rca()
+    selected_month = pd.Timestamp(selected_month)
+    if strat_df.empty:
+        mpr_data = get_active_mpr_data()
+        current = mpr_data[mpr_data["month"].eq(selected_month)].copy()
+        highlights = current.loc[
+            (current["status"] == "Met") & (current["previous_status"] == "Not Met"),
+            "kpi_name",
+        ].drop_duplicates().tolist()
+        if not highlights:
+            highlights = current.loc[current["is_improved"], "kpi_name"].drop_duplicates().tolist()
+        lowlights = current.loc[
+            (current["status"] == "Not Met") & (current["previous_status"] == "Met"),
+            "kpi_name",
+        ].drop_duplicates().tolist()
+        concerns = current.loc[current["is_continuous_red"], "kpi_name"].drop_duplicates().tolist()
+        return (
+            [f"{kpi} turned green in {selected_month.strftime('%b')}." for kpi in highlights],
+            [f"{kpi} moved from green to red in {selected_month.strftime('%b')}." for kpi in lowlights],
+            [f"{kpi} is continuously red." for kpi in concerns],
         )
 
-    show_source_function = actions["source_function"].nunique() > 1
-    table_rows = []
-
-    for _, action_row in actions.iterrows():
-        kpi_name = action_row["kpi_name"]
-        if show_source_function:
-            kpi_name = (
-                f"{action_row['source_function']} — {kpi_name}"
-            )
-
-        table_rows.append(
-            html.Tr(
-                [
-                    html.Td(kpi_name, className="action-table-kpi"),
-                    html.Td(action_row["root_cause"]),
-                    html.Td(action_row["corrective_action"]),
-                    html.Td(action_row["owner"]),
-                    html.Td(
-                        action_row["due_date"],
-                        className="action-table-date",
-                    ),
-                    html.Td(
-                        html.Span(
-                            action_row["status"],
-                            className=(
-                                "action-status-pill "
-                                f"{action_row['status_class']}"
-                            ),
-                        ),
-                        className="action-table-status",
-                    ),
-                ]
-            )
-        )
-
-    return html.Div(
-        html.Table(
-            [
-                html.Colgroup(
-                    [
-                        html.Col(style={"width": "15%"}),
-                        html.Col(style={"width": "24%"}),
-                        html.Col(style={"width": "31%"}),
-                        html.Col(style={"width": "10%"}),
-                        html.Col(style={"width": "10%"}),
-                        html.Col(style={"width": "10%"}),
-                    ]
-                ),
-                html.Thead(
-                    html.Tr(
-                        [
-                            html.Th("Red KPI"),
-                            html.Th("Root cause description"),
-                            html.Th("Corrective action"),
-                            html.Th("Owner"),
-                            html.Th("Due Date"),
-                            html.Th("Status"),
-                        ]
-                    )
-                ),
-                html.Tbody(table_rows),
-            ],
-            className="action-tracker-table",
-        ),
-        className="action-tracker-table-wrap",
+    df = strat_df.sort_values(["kpi_name", "reporting_month"]).copy()
+    df["has_data"] = df["actual"].notna()
+    df["status"] = df.apply(
+        lambda r: "Not Met" if r["has_data"] and r["is_red"] else ("Met" if r["has_data"] else "No Data"),
+        axis=1,
     )
 
+    kpis = df["kpi_name"].dropna().unique()
 
-def create_modal_section_header(number, title, subtitle):
+    highlight_text = []
+    lowlight_text = []
+    concern_text = []
+
+    for kpi in kpis:
+        kpi_df = df[df["kpi_name"] == kpi].sort_values("reporting_month").reset_index(drop=True)
+        curr_idx_list = kpi_df[kpi_df["reporting_month"] == selected_month].index.tolist()
+        if not curr_idx_list:
+            continue
+        curr_idx = curr_idx_list[0]
+        curr_row = kpi_df.iloc[curr_idx]
+
+        if curr_row["status"] == "No Data":
+            continue
+
+        curr_status = curr_row["status"]
+
+        # History before selected month
+        prev_rows = kpi_df.iloc[:curr_idx]
+        prev_data_rows = prev_rows[prev_rows["status"] != "No Data"]
+
+        # Count consecutive reds ending at selected month
+        consecutive_reds = 0
+        for i in range(curr_idx, -1, -1):
+            if kpi_df.iloc[i]["status"] == "Not Met":
+                consecutive_reds += 1
+            elif kpi_df.iloc[i]["status"] == "Met":
+                break
+
+        # Count consecutive reds immediately prior to current month
+        prev_consecutive_reds = 0
+        if curr_status == "Met":
+            for i in range(len(prev_data_rows) - 1, -1, -1):
+                if prev_data_rows.iloc[i]["status"] == "Not Met":
+                    prev_consecutive_reds += 1
+                else:
+                    break
+
+        # Count consecutive greens immediately prior to current month
+        prev_consecutive_greens = 0
+        if curr_status == "Not Met":
+            for i in range(len(prev_data_rows) - 1, -1, -1):
+                if prev_data_rows.iloc[i]["status"] == "Met":
+                    prev_consecutive_greens += 1
+                else:
+                    break
+
+        prev_status = prev_data_rows.iloc[-1]["status"] if not prev_data_rows.empty else None
+
+        # 1. Highlights:
+        # - Turned green after 2+ consecutive red months
+        # - Or turned green from previous red
+        if curr_status == "Met" and prev_status == "Not Met":
+            if prev_consecutive_reds >= 2:
+                highlight_text.append(f"{kpi} turned green after {prev_consecutive_reds} consecutive red months.")
+            else:
+                highlight_text.append(f"{kpi} turned green in {selected_month.strftime('%b')}.")
+
+        # 2. Lowlights:
+        # - Turned red after 2+ consecutive green months
+        # - Or turned red from previous green
+        # - Or newly red
+        if curr_status == "Not Met" and prev_status == "Met":
+            if prev_consecutive_greens >= 2:
+                lowlight_text.append(f"{kpi} moved from green to red after {prev_consecutive_greens} green months.")
+            else:
+                lowlight_text.append(f"{kpi} moved from green to red in {selected_month.strftime('%b')}.")
+        elif curr_status == "Not Met" and prev_status is None:
+            lowlight_text.append(f"{kpi} is below target in {selected_month.strftime('%b')}.")
+
+        # 3. Concerns:
+        # - Red for 2 or more consecutive months
+        if curr_status == "Not Met" and consecutive_reds >= 2:
+            concern_text.append(f"{kpi} is continuously red ({consecutive_reds} consecutive months).")
+
+    return highlight_text, lowlight_text, concern_text
+
+
+def create_modal_section_header(title, subtitle):
     return html.Div(
         [
-            html.Span(str(number), className="rca-modal-section-number"),
             html.Div(
                 [
-                    html.H3(title),
-                    html.P(subtitle),
-                ]
+                    html.H3(title, className="rca-section-heading"),
+                    html.P(subtitle, className="rca-section-subheading"),
+                ],
+                className="rca-header-title-box",
             ),
         ],
         className="rca-modal-section-heading",
@@ -1633,23 +2443,56 @@ def create_modal_section_header(number, title, subtitle):
 def create_continuous_red_detail(function_name, selected_month):
     selected_month = pd.Timestamp(selected_month)
     selected_function_key = function_key(function_name)
+    active_dmb = get_active_dmb_data()
 
-    current_rows = dmb_data[
-        dmb_data["month"].eq(selected_month)
-        & dmb_data["function"].eq(function_name)
+    current_rows = active_dmb[
+        active_dmb["month"].eq(selected_month)
+        & active_dmb["function"].eq(function_name)
+    ].copy()
+    red_rows = current_rows[
+        current_rows["status"].eq("Not Met")
     ].copy()
     continuous_rows = current_rows[
         current_rows["is_continuous_red"]
     ].copy()
 
-    if continuous_rows.empty:
+    rca_data = get_function_rca_data()
+    if rca_data["error"]:
+        return html.Div(
+            [
+                html.Strong("The RCA workbook could not be read."),
+                html.Span(rca_data["error"]),
+            ],
+            className="modal-data-warning",
+        )
+
+    review_kpis = rca_data["review_kpis"]
+    review_red_rows = (
+        review_kpis[
+            review_kpis["function_key"].eq(selected_function_key)
+            & review_kpis["month"].eq(selected_month)
+            & review_kpis["status"].eq("Not Met")
+        ].drop_duplicates(["source_sheet", "kpi_row"])
+        if not review_kpis.empty
+        else pd.DataFrame()
+    )
+
+    dmb_red_rows = red_rows.drop_duplicates("kpi_name")
+
+    if not dmb_red_rows.empty:
+        red_kpis = dmb_red_rows
+    elif not review_red_rows.empty:
+        red_kpis = review_red_rows
+    else:
+        red_kpis = pd.DataFrame(columns=["kpi_name", "source_sheet"])
+
+    if red_kpis.empty:
         return html.Div(
             [
                 html.Div("0", className="modal-empty-number"),
-                html.H3("No continuous-red KPIs"),
+                html.H3("No Red KPIs"),
                 html.P(
-                    "This function has no KPI that remained below target "
-                    "for two consecutive months."
+                    f"This function has no KPI below target for {selected_month.strftime('%B %Y')}."
                 ),
             ],
             className="modal-empty-state",
@@ -1657,27 +2500,164 @@ def create_continuous_red_detail(function_name, selected_month):
 
     selected_kpi_names = continuous_rows["kpi_name"].drop_duplicates().tolist()
 
-    # The full RCA worksheet is shown for the selected function. This preserves
-    # every populated root-cause block from the requested Excel rows, including
-    # a KPI that may be newly red rather than continuously red.
-    function_causes = function_rca_causes[
-        function_rca_causes["function_key"].eq(selected_function_key)
+    function_causes = rca_data["causes"][
+        rca_data["causes"]["function_key"].eq(selected_function_key)
     ].copy()
 
-    documented_kpis = function_causes[
-        ["source_function", "kpi_name", "kpi_key"]
-    ].drop_duplicates()
-
-    function_actions = function_rca_actions[
-        function_rca_actions["function_key"].eq(selected_function_key)
+    function_actions = rca_data["actions"][
+        rca_data["actions"]["function_key"].eq(selected_function_key)
     ].copy()
 
-    source_function_count = function_causes[
-        "source_function"
-    ].nunique()
+    source_sheets = list(
+        dict.fromkeys(
+            (red_kpis["source_sheet"].dropna().tolist() if "source_sheet" in red_kpis.columns else [])
+            + function_causes["source_sheet"].tolist()
+            + function_actions["source_sheet"].tolist()
+        )
+    )
+    show_source_function = len(source_sheets) > 1
+
+    def display_name(source_sheet, kpi_name):
+        if show_source_function and source_sheet:
+            return f"{sheet_function_name(source_sheet)} — {kpi_name}"
+        return kpi_name
+
+    red_kpi_names = red_kpis["kpi_name"].drop_duplicates().tolist()
+    rca_kpis = (
+        function_causes[["source_sheet", "kpi_name"]]
+        .drop_duplicates()
+        .reset_index(drop=True)
+    )
+    function_actions = function_actions.reset_index(drop=True)
+
+    def rca_causes(rca_index):
+        rca_kpi = rca_kpis.loc[rca_index]
+        return function_causes[
+            function_causes["source_sheet"].eq(rca_kpi["source_sheet"])
+            & function_causes["kpi_name"].eq(rca_kpi["kpi_name"])
+        ]
+
+    def applies_to_red_kpi(source_sheet, item_name, red_kpi_name):
+        # A sheet-qualified KPI such as "CTB (12 weeks)(Procurement)" only uses
+        # its own sheet, and month-tagged RCA only applies to the months it names.
+        qualified_sheet = kpi_sheet_qualifier(red_kpi_name, source_sheets)
+        if qualified_sheet and qualified_sheet != source_sheet:
+            return False
+        return name_applies_to_month(item_name, selected_month)
+
+    def best_indexes(scores):
+        best_score = max(scores, default=0)
+        if not best_score:
+            return []
+        return [index for index, score in enumerate(scores) if score == best_score]
+
+    # Match each RCA block to the red KPI it explains. Every red KPI is matched
+    # once across all of the function's sheets.
+    rca_by_red_kpi = {red_index: [] for red_index in range(len(red_kpi_names))}
+    for rca_index, rca_kpi in rca_kpis.iterrows():
+        scores = [
+            kpi_match_score(rca_kpi["kpi_name"], red_kpi_name)
+            if applies_to_red_kpi(
+                rca_kpi["source_sheet"], rca_kpi["kpi_name"], red_kpi_name
+            )
+            else 0
+            for red_kpi_name in red_kpi_names
+        ]
+        for red_index in best_indexes(scores):
+            rca_by_red_kpi[red_index].append(rca_index)
+
+    # A breakdown RCA such as "Win rate for Z30" belongs to the red KPI whose
+    # RCA "Win rate for NPIs" lists "Z30" as a cause.
+    breakdown_rca_indexes = set()
+    directly_matched = {
+        rca_index for indexes in rca_by_red_kpi.values() for rca_index in indexes
+    }
+    for rca_index, rca_kpi in rca_kpis.iterrows():
+        if rca_index in directly_matched:
+            continue
+        breakdown_tokens = kpi_name_tokens(rca_kpi["kpi_name"])
+        for red_index, red_rca_indexes in rca_by_red_kpi.items():
+            parent_indexes = [
+                parent_index
+                for parent_index in red_rca_indexes
+                if parent_index in directly_matched
+                and rca_kpis.at[parent_index, "source_sheet"] == rca_kpi["source_sheet"]
+            ]
+            for parent_index in parent_indexes:
+                parent_tokens = kpi_name_tokens(rca_kpis.at[parent_index, "kpi_name"])
+                extra_tokens = breakdown_tokens - parent_tokens
+                cause_tokens = set().union(
+                    *(
+                        kpi_name_tokens(cause)
+                        for cause in rca_causes(parent_index)["cause"]
+                    )
+                )
+                if (
+                    extra_tokens
+                    and breakdown_tokens - extra_tokens
+                    and extra_tokens <= cause_tokens
+                ):
+                    rca_by_red_kpi[red_index].append(rca_index)
+                    breakdown_rca_indexes.add(rca_index)
+                    break
+
+    # The RCA names a red KPI was matched to also identify its actions.
+    actions_by_red_kpi = {red_index: [] for red_index in range(len(red_kpi_names))}
+    for action_index, action in function_actions.iterrows():
+        allowed = [
+            applies_to_red_kpi(
+                action["source_sheet"], action["kpi_name"], red_kpi_name
+            )
+            for red_kpi_name in red_kpi_names
+        ]
+        scores = []
+        for red_index, red_kpi_name in enumerate(red_kpi_names):
+            aliases = [red_kpi_name] + [
+                rca_kpis.at[rca_index, "kpi_name"]
+                for rca_index in rca_by_red_kpi[red_index]
+                if rca_kpis.at[rca_index, "source_sheet"] == action["source_sheet"]
+            ]
+            scores.append(
+                max(kpi_match_score(action["kpi_name"], alias) for alias in aliases)
+                if allowed[red_index]
+                else 0
+            )
+
+        if not max(scores, default=0):
+            scores = [
+                1
+                if allowed[red_index]
+                and any(
+                    rca_kpis.at[rca_index, "source_sheet"] == action["source_sheet"]
+                    and root_cause_matches(
+                        action["root_cause"], rca_causes(rca_index)["cause"]
+                    )
+                    for rca_index in rca_by_red_kpi[red_index]
+                )
+                else 0
+                for red_index in range(len(red_kpi_names))
+            ]
+
+        for red_index in best_indexes(scores):
+            actions_by_red_kpi[red_index].append(action_index)
+
+    matched_rca_indexes = {
+        rca_index for indexes in rca_by_red_kpi.values() for rca_index in indexes
+    }
+
+    total_red_causes = sum(len(rca_causes(rca_idx)) for rca_idx in matched_rca_indexes)
+
+    red_kpi_label = f"Red KPIs in {selected_month.strftime('%B %Y')}"
 
     summary = html.Div(
         [
+            html.Div(
+                [
+                    html.Strong(str(len(red_kpis))),
+                    html.Span(red_kpi_label),
+                ],
+                className="modal-summary-card summary-card-red",
+            ),
             html.Div(
                 [
                     html.Strong(str(len(selected_kpi_names))),
@@ -1687,14 +2667,7 @@ def create_continuous_red_detail(function_name, selected_month):
             ),
             html.Div(
                 [
-                    html.Strong(str(len(documented_kpis))),
-                    html.Span("RCA KPIs documented"),
-                ],
-                className="modal-summary-card summary-card-teal",
-            ),
-            html.Div(
-                [
-                    html.Strong(str(len(function_causes))),
+                    html.Strong(str(total_red_causes)),
                     html.Span("Top causes"),
                 ],
                 className="modal-summary-card summary-card-amber",
@@ -1703,90 +2676,154 @@ def create_continuous_red_detail(function_name, selected_month):
         className="modal-summary-grid",
     )
 
-    if function_causes.empty:
-        return html.Div(
+    function_review_kpis = (
+        review_kpis[review_kpis["function_key"].eq(selected_function_key)][
+            ["source_sheet", "kpi_name"]
+        ].drop_duplicates()
+        if not review_kpis.empty
+        else pd.DataFrame(columns=["source_sheet", "kpi_name"])
+    )
+
+    def home_sheet(red_kpi_name, kpi_actions):
+        qualified_sheet = kpi_sheet_qualifier(red_kpi_name, source_sheets)
+        if qualified_sheet:
+            return qualified_sheet
+        if not kpi_actions.empty:
+            return kpi_actions["source_sheet"].iloc[0]
+        review_indexes = best_indexes(
             [
-                summary,
-                html.Div(
-                    [
-                        html.Strong(
-                            "Detailed RCA data is not available for this function."
-                        ),
-                        html.Span(
-                            " Add RCA data to the matching function worksheet "
-                            f"in {FUNCTION_RCA_FILE.name}."
-                        ),
-                    ],
-                    className="modal-data-warning",
-                ),
+                kpi_match_score(red_kpi_name, review_name)
+                for review_name in function_review_kpis["kpi_name"]
             ]
         )
+        if review_indexes:
+            return function_review_kpis["source_sheet"].iloc[review_indexes[0]]
+        return ""
 
-    cause_tables = []
+    red_kpi_tables = []
+    modal_kpi_options = []
 
-    for _, documented_kpi in documented_kpis.iterrows():
-        source_function = documented_kpi["source_function"]
-        source_kpi_name = documented_kpi["kpi_name"]
-        current_kpi_key = documented_kpi["kpi_key"]
+    def add_card(
+        title,
+        causes,
+        actions,
+        red_kpi_name=None,
+        is_red=True,
+        missing_action_text=None,
+    ):
+        card_id = slug_kpi_id(f"modal-card-{red_kpi_name or title}")
+        card = create_kpi_rca_card(
+            title,
+            causes,
+            actions,
+            red_kpi_name=red_kpi_name,
+            card_id=card_id,
+            is_red=is_red,
+            missing_action_text=missing_action_text,
+        )
+        red_kpi_tables.append(card)
+        modal_kpi_options.append({"label": red_kpi_name or title, "value": card_id})
 
-        causes = function_causes[
-            function_causes["source_function"].eq(source_function)
-            & function_causes["kpi_key"].eq(current_kpi_key)
-        ].sort_values("cause_rank")
+    for red_index, red_kpi_name in enumerate(red_kpi_names):
+        kpi_actions = function_actions.loc[actions_by_red_kpi[red_index]]
+        red_rca_indexes = rca_by_red_kpi[red_index]
 
-        display_kpi_name = (
-            f"{source_function} — {source_kpi_name}"
-            if source_function_count > 1
-            else source_kpi_name
+        if not red_rca_indexes:
+            add_card(
+                display_name(home_sheet(red_kpi_name, kpi_actions), red_kpi_name),
+                function_causes.iloc[0:0],
+                kpi_actions,
+            )
+            continue
+
+        rca_sheets = {rca_kpis.at[index, "source_sheet"] for index in red_rca_indexes}
+        for position, rca_index in enumerate(red_rca_indexes):
+            rca_kpi = rca_kpis.loc[rca_index]
+            title = display_name(rca_kpi["source_sheet"], rca_kpi["kpi_name"])
+            if rca_index in breakdown_rca_indexes:
+                # The parent card already lists this red KPI's actions.
+                add_card(
+                    title,
+                    rca_causes(rca_index),
+                    kpi_actions.iloc[0:0],
+                    missing_action_text=f"Actions are listed under {display_name(rca_kpi['source_sheet'], red_kpi_name)}",
+                )
+                continue
+            # Actions from a sheet without an RCA card go on the first card.
+            card_actions = kpi_actions[
+                kpi_actions["source_sheet"].eq(rca_kpi["source_sheet"])
+                | (
+                    (position == 0)
+                    & ~kpi_actions["source_sheet"].isin(rca_sheets)
+                )
+            ]
+            names_differ = function_key(red_kpi_name) != function_key(
+                rca_kpi["kpi_name"]
+            )
+            add_card(
+                title,
+                rca_causes(rca_index),
+                card_actions,
+                red_kpi_name=(
+                    display_name(rca_kpi["source_sheet"], red_kpi_name)
+                    if names_differ
+                    else None
+                ),
+            )
+
+    unique_modal_options = []
+    seen_vals = set()
+    for opt in modal_kpi_options:
+        if opt["value"] not in seen_vals:
+            seen_vals.add(opt["value"])
+            unique_modal_options.append(opt)
+
+    pill_box = None
+    if unique_modal_options:
+        pill_box = html.Div(
+            [
+                html.Span("Quick Jump to KPI:", className="rca-pill-label"),
+                html.Div(
+                    [
+                        html.Button(
+                            opt["label"],
+                            id={"type": "modal-rca-kpi-pill", "target": opt["value"]},
+                            className="modal-rca-kpi-pill",
+                            n_clicks=0,
+                        )
+                        for opt in unique_modal_options
+                    ],
+                    className="modal-rca-pills-row",
+                ),
+            ],
+            className="modal-rca-pill-box",
         )
 
-        cause_tables.append(
-            create_cause_table(display_kpi_name, causes)
+    section_children = [
+        create_modal_section_header(
+            "Root Cause Analysis & Actions on Red KPIs",
+            (
+                "Red KPIs with their top causes, percentage "
+                "contribution to the KPI gap and open corrective "
+                "actions"
+            ),
+        ),
+    ]
+    if pill_box:
+        section_children.append(pill_box)
+    section_children.append(
+        html.Div(
+            red_kpi_tables,
+            className="cause-table-stack",
         )
-
-    action_tracker = create_action_tracker_table(function_actions)
+    )
 
     return html.Div(
         [
             summary,
-            html.Div(
-                [
-                    html.A("Root-cause tables", href="#modal-root-causes"),
-                    html.A("Action tracker", href="#modal-action-tracker"),
-                ],
-                className="rca-modal-navigation",
-            ),
             html.Section(
-                [
-                    create_modal_section_header(
-                        1,
-                        "Root Cause Analysis",
-                        (
-                            "Top causes and their percentage contribution "
-                            "to each KPI gap"
-                        ),
-                    ),
-                    html.Div(
-                        cause_tables,
-                        className="cause-table-stack",
-                    ),
-                ],
+                section_children,
                 id="modal-root-causes",
-                className="rca-workspace-section",
-            ),
-            html.Section(
-                [
-                    create_modal_section_header(
-                        2,
-                        "Corrective Action Tracker",
-                        (
-                            "Root cause, corrective action, owner, "
-                            "due date and current status"
-                        ),
-                    ),
-                    action_tracker,
-                ],
-                id="modal-action-tracker",
                 className="rca-workspace-section",
             ),
         ],
@@ -1867,7 +2904,10 @@ def create_imperative_chart(current_data):
             y=summary["percentage"],
             customdata=custom_data,
             marker={
-                "color": "#0877b9",
+                "color": [
+                    "#168b69" if percentage >= GAUGE_TARGET else "#dc3d56"
+                    for percentage in summary["percentage"]
+                ],
                 "line": {"color": "#ffffff", "width": 1},
             },
             text=summary["percentage"].map(lambda value: f"{value:.1f}%"),
@@ -1931,7 +2971,8 @@ def create_imperative_chart(current_data):
 # =========================================================
 
 def create_trend_chart(selected_month):
-    trend = mpr_data[mpr_data["month"] <= selected_month].copy()
+    active_mpr = get_active_mpr_data()
+    trend = active_mpr[active_mpr["month"] <= selected_month].copy()
 
     trend = trend[
         trend["Actual"].notna()
@@ -2063,301 +3104,381 @@ def create_trend_chart(selected_month):
 # DASHBOARD LAYOUT
 # =========================================================
 
-app.layout = html.Div(
-    [
-        html.Header(
-            [
-                html.Div(
-                    [
-                        html.Div("D", className="brand-logo"),
-                        html.Div(
-                            [
-                                html.H1("DMB Performance Dashboard"),
-                                html.P("Executive KPI view · 2026"),
-                            ],
-                            className="brand-text",
-                        ),
-                    ],
-                    className="brand-section",
-                ),
-                html.Nav(
-                    [
-                        html.A(
-                            "MPR",
-                            href="#mpr-section",
-                            className=(
-                                "navigation-tab navigation-tab-active"
+def serve_layout():
+    active_mpr = get_active_mpr_data()
+    active_dmb = get_active_dmb_data()
+    active_strat = get_active_rca_actions()
+
+    curr_mpr_months, curr_default_mpr_month = get_dynamic_reporting_months(active_mpr, active_strat)
+    curr_dmb_months, curr_default_dmb_month = get_dynamic_reporting_months(active_dmb, active_strat)
+
+    return html.Div(
+        [
+            html.Header(
+                [
+                    html.Div(
+                        [
+                            html.Div("D", className="brand-logo"),
+                            html.Div(
+                                [
+                                    html.H1("DMB Performance Dashboard"),
+                                    html.P("Executive KPI view · 2026"),
+                                ],
+                                className="brand-text",
                             ),
-                        ),
-                        html.A(
-                            "DMB",
-                            href="#dmb-section",
-                            className="navigation-tab",
-                        ),
-                    ],
-                    className="navigation-tabs",
-                ),
-                html.Button(
-                    "Download 1 Pager",
-                    id="download-one-pager-button",
-                    className="download-button",
-                    n_clicks=0,
-                    title="Download the complete dashboard as one long PNG image",
-                ),
-            ],
-            className="top-navigation",
-        ),
-        dcc.Store(id="one-pager-download-state"),
-        html.Div(
-            [
-                insight_card(
-                    "Highlights",
-                    "highlights-content",
-                    "highlights-count",
-                    "highlight-card",
-                ),
-                insight_card(
-                    "Lowlights",
-                    "lowlights-content",
-                    "lowlights-count",
-                    "lowlight-card",
-                ),
-                insight_card(
-                    "Concerns",
-                    "concerns-content",
-                    "concerns-count",
-                    "concern-card",
-                ),
-            ],
-            className="executive-insights",
-        ),
-        html.Section(
-            [
-                section_header(
-                    "mpr-section",
-                    "MPR — Overall MoS KPI Performance",
-                    "Critical KPI performance by strategic imperative",
-                    "MPR month",
-                    "mpr-month-filter",
-                    create_month_options(mpr_months),
-                ),
-                html.Div(
-                    [
-                        kpi_card(
-                            "Critical KPIs",
-                            "mpr-total-kpis",
-                            "#082d4c",
-                        ),
-                        kpi_card(
-                            "KPIs met",
-                            "mpr-met-kpis",
-                            "#168b69",
-                        ),
-                        kpi_card(
-                            "KPIs not met",
-                            "mpr-not-met-kpis",
-                            "#dc3d56",
-                        ),
-                        kpi_card(
-                            "KPIs improved",
-                            "mpr-improved-kpis",
-                            "#c18100",
-                        ),
-                        kpi_card(
-                            "Neither improved nor met",
-                            "mpr-neither-kpis",
-                            "#dc3d56",
-                        ),
-                    ],
-                    className="kpi-summary-grid",
-                ),
-                html.Div(
-                    [
-                        html.Div(
-                            [
-                                html.Div(
-                                    [
-                                        html.H3("KPIs met & improved"),
-                                        html.Span(
-                                            f"Threshold {GAUGE_TARGET}%",
-                                            className="chart-note",
-                                        ),
-                                    ],
-                                    className="chart-title-row",
+                        ],
+                        className="brand-section",
+                    ),
+                    html.Nav(
+                        [
+                            html.A(
+                                "MPR",
+                                href="#mpr-section",
+                                className=(
+                                    "navigation-tab navigation-tab-active"
                                 ),
-                                dcc.Graph(
-                                    id="mpr-gauge",
-                                    config={"displayModeBar": False},
-                                ),
-                            ],
-                            className="mpr-chart-card gauge-chart-card",
-                        ),
-                        html.Div(
-                            [
-                                html.Div(
-                                    [
-                                        html.H3(
-                                            "Strategic imperative performance"
-                                        ),
-                                        html.Span(
-                                            id="imperative-month",
-                                            className="chart-note",
-                                        ),
-                                    ],
-                                    className="chart-title-row",
-                                ),
-                                dcc.Graph(
-                                    id="mpr-imperative-chart",
-                                    config={
-                                        "displayModeBar": False,
-                                        "scrollZoom": False,
-                                    },
-                                ),
-                            ],
-                            className=(
-                                "mpr-chart-card imperative-chart-card"
                             ),
-                        ),
-                        html.Div(
-                            [
-                                html.Div(
-                                    [html.H3("Monthly Performance Trend")],
-                                    className="chart-title-row",
-                                ),
-                                dcc.Graph(
-                                    id="mpr-trend-chart",
-                                    config={"displayModeBar": False},
-                                ),
-                            ],
-                            className="mpr-chart-card trend-chart-card",
-                        ),
-                    ],
-                    className="mpr-visual-grid",
-                ),
-            ],
-            className="dashboard-section",
-        ),
-        html.Section(
-            [
-                section_header(
-                    "dmb-section",
-                    "DMB — Function-wise KPI Performance",
-                    "Core, enabling and mandatory outcome performance",
-                    "DMB month",
-                    "dmb-month-filter",
-                    create_month_options(dmb_months),
-                ),
-                html.Div(
-                    [
-                        html.Div(
-                            [
-                                html.Span(
-                                    className="legend-dot legend-green"
-                                ),
-                                html.Span("KPIs met"),
-                            ],
-                            className="dmb-legend-item",
-                        ),
-                        html.Div(
-                            [
-                                html.Span(
-                                    className="legend-dot legend-red"
-                                ),
-                                html.Span("KPIs not met"),
-                            ],
-                            className="dmb-legend-item",
-                        ),
-                        html.Div(
-                            [
-                                html.Span(
-                                    className="legend-dot legend-blue"
-                                ),
-                                html.Span(f"Performance target {GAUGE_TARGET}%"),
-                            ],
-                            className="dmb-legend-item",
-                        ),
-                    ],
-                    className="dmb-legend",
-                ),
-                html.Div(
-                    id="function-cards-container",
-                    className="function-grid",
-                ),
-            ],
-            className="dashboard-section",
-        ),
-        html.Section(
-            [
-                html.Div(
-                    [
-                        html.H2(
-                            "Cause and Actions of Red KPIs at MoS Level"
-                        ),
-                        html.Span(
-                            id="rca-reporting-month",
-                            className="rca-month",
-                        ),
-                    ],
-                    className="rca-title-bar",
-                ),
-                html.Div(id="rca-table-container"),
-            ],
-            id="rca-section",
-            className="rca-section",
-        ),
-        html.Div(
-            [
-                html.Button(
-                    id="continuous-red-modal-backdrop",
-                    className="continuous-red-modal-backdrop",
-                    n_clicks=0,
-                    title="Close details",
-                ),
-                html.Div(
-                    [
-                        html.Div(
-                            [
-                                html.Div(
-                                    [
-                                        html.P(
-                                            "DMB ROOT-CAUSE REVIEW",
-                                            className="modal-eyebrow",
-                                        ),
-                                        html.H2(
-                                            id="continuous-red-modal-title"
-                                        ),
-                                        html.P(
-                                            id="continuous-red-modal-month",
-                                            className="modal-reporting-month",
-                                        ),
-                                    ]
-                                ),
-                                html.Button(
-                                    "×",
-                                    id="close-continuous-red-modal",
-                                    n_clicks=0,
-                                    className="continuous-red-modal-close",
-                                    title="Close details",
-                                ),
-                            ],
-                            className="continuous-red-modal-header",
-                        ),
-                        html.Div(
-                            id="continuous-red-modal-body",
-                            className="continuous-red-modal-body",
-                        ),
-                    ],
-                    className="continuous-red-modal-dialog",
-                ),
-            ],
-            id="continuous-red-modal",
-            className=(
-                "continuous-red-modal continuous-red-modal-hidden"
+                            html.A(
+                                "DMB",
+                                href="#dmb-section",
+                                className="navigation-tab",
+                            ),
+                        ],
+                        className="navigation-tabs",
+                    ),
+                    html.Button(
+                        "Download 1 Pager",
+                        id="download-one-pager-button",
+                        className="download-button",
+                        n_clicks=0,
+                        title="Download the complete dashboard as one long PNG image",
+                    ),
+                ],
+                className="top-navigation",
             ),
-        ),
-    ],
-    className="page-shell",
+            dcc.Store(id="one-pager-download-state"),
+            dcc.Interval(id="live-sync-interval", interval=3600000, n_intervals=0),
+            dcc.Store(id="live-sync-state-store"),
+            html.Section(
+                [
+                    html.Div(
+                        [
+                            html.H2(
+                                "Highlights & Lowlights of KPIs at MoS Level"
+                            ),
+                            html.Span(
+                                id="insights-reporting-month",
+                                className="insights-month",
+                            ),
+                        ],
+                        className="insights-title-bar",
+                    ),
+                    html.Div(
+                        [
+                            insight_card(
+                                "Highlights",
+                                "highlights-content",
+                                "highlights-count",
+                                "highlight-card",
+                            ),
+                            insight_card(
+                                "Lowlights",
+                                "lowlights-content",
+                                "lowlights-count",
+                                "lowlight-card",
+                            ),
+                            insight_card(
+                                "Concerns",
+                                "concerns-content",
+                                "concerns-count",
+                                "concern-card",
+                            ),
+                        ],
+                        className="executive-insights",
+                    ),
+                ],
+                id="executive-insights-section",
+                className="executive-insights-section",
+            ),
+            html.Section(
+                [
+                    section_header(
+                        "mpr-section",
+                        "MPR — Overall MoS KPI Performance",
+                        "Critical KPI performance by strategic imperative",
+                        "MPR month",
+                        "mpr-month-filter",
+                        create_month_options(curr_mpr_months),
+                        default_value=curr_default_mpr_month.strftime("%Y-%m-%d"),
+                    ),
+                    html.Div(
+                        [
+                            html.Div(
+                                [
+                                    kpi_card(
+                                        "Critical KPIs",
+                                        "mpr-total-kpis",
+                                        "#082d4c",
+                                    ),
+                                    kpi_card(
+                                        "KPIs met",
+                                        "mpr-met-kpis",
+                                        "#168b69",
+                                    ),
+                                    kpi_card(
+                                        "KPIs not met",
+                                        "mpr-not-met-kpis",
+                                        "#dc3d56",
+                                    ),
+                                ],
+                                className="kpi-summary-group kpi-summary-group-3",
+                            ),
+                            html.Div(
+                                [
+                                    kpi_card(
+                                        "KPIs improved",
+                                        "mpr-improved-kpis",
+                                        "#c18100",
+                                    ),
+                                    kpi_card(
+                                        "Neither improved nor met",
+                                        "mpr-neither-kpis",
+                                        "#dc3d56",
+                                    ),
+                                ],
+                                className="kpi-summary-group kpi-summary-group-2",
+                            ),
+                        ],
+                        className="kpi-summary-grid",
+                    ),
+                    html.Div(
+                        [
+                            html.Div(
+                                [
+                                    html.Div(
+                                        [
+                                            html.H3("KPIs met & improved"),
+                                            html.Span(
+                                                f"Threshold {GAUGE_TARGET}%",
+                                                className="chart-note",
+                                            ),
+                                        ],
+                                        className="chart-title-row",
+                                    ),
+                                    dcc.Graph(
+                                        id="mpr-gauge",
+                                        config={"displayModeBar": False},
+                                    ),
+                                ],
+                                className="mpr-chart-card gauge-chart-card",
+                            ),
+                            html.Div(
+                                [
+                                    html.Div(
+                                        [
+                                            html.H3(
+                                                "Strategic imperative performance"
+                                            ),
+                                            html.Span(
+                                                id="imperative-month",
+                                                className="chart-note",
+                                            ),
+                                        ],
+                                        className="chart-title-row",
+                                    ),
+                                    dcc.Graph(
+                                        id="mpr-imperative-chart",
+                                        config={
+                                            "displayModeBar": False,
+                                            "scrollZoom": False,
+                                        },
+                                    ),
+                                ],
+                                className=(
+                                    "mpr-chart-card imperative-chart-card"
+                                ),
+                            ),
+                            html.Div(
+                                [
+                                    html.Div(
+                                        [html.H3("Monthly Performance Trend")],
+                                        className="chart-title-row",
+                                    ),
+                                    dcc.Graph(
+                                        id="mpr-trend-chart",
+                                        config={"displayModeBar": False},
+                                    ),
+                                ],
+                                className="mpr-chart-card trend-chart-card",
+                            ),
+                        ],
+                        className="mpr-visual-grid",
+                    ),
+                ],
+                className="dashboard-section",
+            ),
+            html.Section(
+                [
+                    section_header(
+                        "dmb-section",
+                        "DMB — Function-wise KPI Performance",
+                        "Core, enabling and mandatory outcome performance",
+                        "DMB month",
+                        "dmb-month-filter",
+                        create_month_options(curr_dmb_months),
+                        default_value=curr_default_dmb_month.strftime("%Y-%m-%d"),
+                    ),
+                    html.Div(
+                        [
+                            html.Div(
+                                [
+                                    html.Span(
+                                        className="legend-dot legend-green"
+                                    ),
+                                    html.Span("KPIs met"),
+                                ],
+                                className="dmb-legend-item",
+                            ),
+                            html.Div(
+                                [
+                                    html.Span(
+                                        className="legend-dot legend-red"
+                                    ),
+                                    html.Span("KPIs not met"),
+                                ],
+                                className="dmb-legend-item",
+                            ),
+                            html.Div(
+                                [
+                                    html.Span(
+                                        className="legend-dot legend-blue"
+                                    ),
+                                    html.Span(f"Performance target {GAUGE_TARGET}%"),
+                                ],
+                                className="dmb-legend-item",
+                            ),
+                        ],
+                        className="dmb-legend",
+                    ),
+                    html.Div(
+                        id="function-cards-container",
+                        className="function-grid",
+                    ),
+                ],
+                className="dashboard-section",
+            ),
+            html.Section(
+                [
+                    html.Div(
+                        [
+                            html.H2(
+                                "Cause and Actions of Red KPIs at MoS Level"
+                            ),
+                            html.Span(
+                                id="rca-reporting-month",
+                                className="rca-month",
+                            ),
+                        ],
+                        className="rca-title-bar",
+                    ),
+                    html.Div(id="rca-table-container"),
+                ],
+                id="rca-section",
+                className="rca-section",
+            ),
+            html.Div(
+                [
+                    html.Button(
+                        id="continuous-red-modal-backdrop",
+                        className="continuous-red-modal-backdrop",
+                        n_clicks=0,
+                        title="Close details",
+                    ),
+                    html.Div(
+                        [
+                            html.Div(
+                                [
+                                    html.Div(
+                                        [
+                                            html.P(
+                                                "DMB ROOT-CAUSE REVIEW",
+                                                className="modal-eyebrow",
+                                            ),
+                                            html.H2(
+                                                id="continuous-red-modal-title"
+                                            ),
+                                            html.P(
+                                                id="continuous-red-modal-month",
+                                                className="modal-reporting-month",
+                                            ),
+                                        ]
+                                    ),
+                                    html.Button(
+                                        "×",
+                                        id="close-continuous-red-modal",
+                                        n_clicks=0,
+                                        className="continuous-red-modal-close",
+                                        title="Close details",
+                                    ),
+                                ],
+                                className="continuous-red-modal-header",
+                            ),
+                            html.Div(
+                                id="continuous-red-modal-body",
+                                className="continuous-red-modal-body",
+                            ),
+                            html.Div(
+                                id="continuous-red-modal-scroll-dummy",
+                                style={"display": "none"},
+                            ),
+                        ],
+                        className="continuous-red-modal-dialog",
+                    ),
+                ],
+                id="continuous-red-modal",
+                className=(
+                    "continuous-red-modal continuous-red-modal-hidden"
+                ),
+            ),
+        ],
+        className="page-shell",
+    )
+
+
+app.layout = serve_layout
+
+
+# =========================================================
+# BACKGROUND LIVE SYNC REFRESH (1-HOUR CYCLE)
+# =========================================================
+
+@app.callback(
+    Output("live-sync-state-store", "data"),
+    Input("live-sync-interval", "n_intervals"),
+    prevent_initial_call=False,
 )
+def handle_live_sync_trigger(n_intervals):
+    sync_result = sharepoint_sync.sync_now()
+    if sync_result.get("updated", False):
+        data_loader.reload_all_data(force=True)
+    return sync_result
+
+
+@app.callback(
+    Output("mpr-month-filter", "options"),
+    Output("dmb-month-filter", "options"),
+    Input("live-sync-state-store", "data"),
+    prevent_initial_call=True,
+)
+def refresh_month_dropdown_options(sync_data):
+    active_mpr = get_active_mpr_data()
+    active_dmb = get_active_dmb_data()
+    active_strat = get_active_rca_actions()
+
+    curr_mpr_months, _ = get_dynamic_reporting_months(active_mpr, active_strat)
+    curr_dmb_months, _ = get_dynamic_reporting_months(active_dmb, active_strat)
+
+    return create_month_options(curr_mpr_months), create_month_options(curr_dmb_months)
 
 
 # =========================================================
@@ -2374,6 +3495,7 @@ app.layout = html.Div(
     Output("mpr-imperative-chart", "figure"),
     Output("imperative-month", "children"),
     Output("mpr-trend-chart", "figure"),
+    Output("insights-reporting-month", "children"),
     Output("highlights-content", "children"),
     Output("highlights-count", "children"),
     Output("lowlights-content", "children"),
@@ -2381,52 +3503,15 @@ app.layout = html.Div(
     Output("concerns-content", "children"),
     Output("concerns-count", "children"),
     Input("mpr-month-filter", "value"),
+    Input("live-sync-state-store", "data"),
 )
-def update_mpr_dashboard(month_value):
+def update_mpr_dashboard(month_value, sync_data):
+    mpr_data = get_active_mpr_data()
     selected_month = pd.Timestamp(month_value)
     current = mpr_data[mpr_data["month"].eq(selected_month)].copy()
     summary = get_month_summary(mpr_data, selected_month)
 
-    highlights = current.loc[
-        (current["status"] == "Met")
-        & (current["previous_status"] == "Not Met"),
-        "kpi_name",
-    ].drop_duplicates().tolist()
-
-    if not highlights:
-        highlights = current.loc[
-            current["is_improved"],
-            "kpi_name",
-        ].drop_duplicates().tolist()
-
-    highlight_text = [
-        f"{kpi} turned green in {selected_month.strftime('%b')}."
-        for kpi in highlights
-    ]
-
-    lowlights = current.loc[
-        (current["status"] == "Not Met")
-        & (current["previous_status"] == "Met"),
-        "kpi_name",
-    ].drop_duplicates().tolist()
-
-    lowlight_text = [
-        (
-            f"{kpi} moved from green to red "
-            f"in {selected_month.strftime('%b')}."
-        )
-        for kpi in lowlights
-    ]
-
-    concerns = current.loc[
-        current["is_continuous_red"],
-        "kpi_name",
-    ].drop_duplicates().tolist()
-
-    concern_text = [
-        f"{kpi} is continuously red."
-        for kpi in concerns
-    ]
+    highlight_text, lowlight_text, concern_text = get_strategic_executive_insights(selected_month)
 
     return (
         summary["total_kpis"],
@@ -2438,22 +3523,26 @@ def update_mpr_dashboard(month_value):
         create_imperative_chart(current),
         selected_month.strftime("%B %Y"),
         create_trend_chart(selected_month),
+        selected_month.strftime("%B %Y"),
         insight_list(
             highlight_text,
             "No positive movement identified.",
         ),
-        min(len(highlight_text), INSIGHT_DISPLAY_LIMIT),
+        len(highlight_text),
         insight_list(
             lowlight_text,
             "No negative movement identified.",
         ),
-        min(len(lowlight_text), INSIGHT_DISPLAY_LIMIT),
+        len(lowlight_text),
         insight_list(
             concern_text,
             "No continuous-red KPI identified.",
         ),
-        min(len(concern_text), INSIGHT_DISPLAY_LIMIT),
+        len(concern_text),
     )
+
+
+
 
 
 # =========================================================
@@ -2463,26 +3552,23 @@ def update_mpr_dashboard(month_value):
 @app.callback(
     Output("function-cards-container", "children"),
     Input("dmb-month-filter", "value"),
+    Input("live-sync-state-store", "data"),
 )
-def update_dmb_function_cards(month_value):
+def update_dmb_function_cards(month_value, sync_data):
+    dmb_data = get_active_dmb_data()
     selected_month = pd.Timestamp(month_value)
     current = dmb_data[dmb_data["month"].eq(selected_month)].copy()
 
-    available_functions = current["function"].dropna().unique().tolist()
+    ordered_functions = list(FUNCTION_ORDER)
 
-    ordered_functions = [
-        function_name
-        for function_name in FUNCTION_ORDER
-        if function_name in available_functions
+    available_functions = [
+        f for f in current["function"].dropna().unique().tolist()
+        if str(f).strip().lower() not in EXCLUDED_DMB_FUNCTIONS
     ]
 
-    ordered_functions.extend(
-        sorted(
-            function_name
-            for function_name in available_functions
-            if function_name not in ordered_functions
-        )
-    )
+    for function_name in available_functions:
+        if function_name not in ordered_functions:
+            ordered_functions.append(function_name)
 
     if not ordered_functions:
         return html.P(
@@ -2500,14 +3586,56 @@ def update_dmb_function_cards(month_value):
     Output("rca-table-container", "children"),
     Output("rca-reporting-month", "children"),
     Input("mpr-month-filter", "value"),
+    Input("live-sync-state-store", "data"),
 )
-def update_rca_table(month_value):
+def update_rca_table(month_value, sync_data):
     selected_month = pd.Timestamp(month_value)
-
     return (
         create_rca_table(selected_month),
         selected_month.strftime("%B %Y"),
     )
+
+
+app.clientside_callback(
+    """
+    function(nClicksList) {
+        if (!nClicksList || nClicksList.length === 0) {
+            return window.dash_clientside.no_update;
+        }
+        var triggered = window.dash_clientside.callback_context.triggered;
+        if (!triggered || triggered.length === 0) {
+            return window.dash_clientside.no_update;
+        }
+        var trig = triggered[0];
+        if (!trig || !trig.value) {
+            return window.dash_clientside.no_update;
+        }
+        try {
+            var propId = trig.prop_id;
+            var jsonStr = propId.replace(/\\.n_clicks$/, '');
+            var parsed = JSON.parse(jsonStr);
+            var targetId = parsed.target;
+            if (targetId) {
+                var el = document.getElementById(targetId);
+                if (el) {
+                    el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                    el.classList.add('kpi-card-highlighted');
+                    setTimeout(function() {
+                        el.classList.remove('kpi-card-highlighted');
+                    }, 2500);
+                }
+            }
+        } catch(err) {
+            console.error("Scroll error:", err);
+        }
+        return window.dash_clientside.no_update;
+    }
+    """,
+    Output("continuous-red-modal-scroll-dummy", "children"),
+    Input({"type": "modal-rca-kpi-pill", "target": ALL}, "n_clicks"),
+    prevent_initial_call=True,
+)
+
 
 
 # =========================================================
@@ -2720,12 +3848,9 @@ app.clientside_callback(
     Input("download-one-pager-button", "n_clicks"),
     prevent_initial_call=True,
 )
-from app_poller_integration import start_dmb_mailbox_poller
-import data_loader
-
-# Starts the 24/7 background SharePoint mailbox poller and reloads data automatically
-start_dmb_mailbox_poller(
-    reload_callback=lambda: data_loader.load_data() if hasattr(data_loader, "load_data") else None
+# Starts the 24/7 background SharePoint Live Sync Engine
+sharepoint_sync.start_live_sync(
+    callback=lambda: data_loader.reload_all_data(force=True)
 )
 
 if __name__ == "__main__":
