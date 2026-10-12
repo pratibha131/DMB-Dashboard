@@ -776,6 +776,34 @@ def parse_review_kpi_rows(raw_sheet, sheet_name):
     return records
 
 
+def parse_impact_percent_value(val):
+    """
+    Parses raw impact value from Excel which may be:
+    - float/decimal: 0.554 -> 55.4, 0.4 -> 40.0
+    - string percentage: '55.4%' -> 55.4
+    - integer: 1 -> 100.0, 40 -> 40.0
+    """
+    if val is None or pd.isna(val):
+        return None
+    if isinstance(val, (int, float)):
+        num = float(val)
+        if abs(num) <= 1.0 and num != 0:
+            num *= 100
+        return round(num, 2)
+    s = str(val).strip().replace("\xa0", "")
+    if not s or s in {"—", "-", "none", "nan", "null"}:
+        return None
+    has_percent = "%" in s
+    s_clean = s.replace("%", "").strip()
+    try:
+        num = float(s_clean)
+        if not has_percent and abs(num) <= 1.0 and num != 0:
+            num *= 100
+        return round(num, 2)
+    except (ValueError, TypeError):
+        return None
+
+
 def load_function_rca_details():
     cause_columns = [
         "function",
@@ -1000,14 +1028,8 @@ def load_function_rca_details():
                 cause_rank += 1
                 impact_percent = None
                 if impact_row_index is not None:
-                    raw_impact = pd.to_numeric(
-                        raw_sheet.iat[impact_row_index, column_index],
-                        errors="coerce",
-                    )
-                    if not pd.isna(raw_impact):
-                        impact_percent = float(raw_impact)
-                        if abs(impact_percent) <= 1:
-                            impact_percent *= 100
+                    raw_impact = raw_sheet.iat[impact_row_index, column_index]
+                    impact_percent = parse_impact_percent_value(raw_impact)
 
                 cause_records.append(
                     {
@@ -1929,16 +1951,18 @@ def is_closed_action_status(status_val):
 
 
 def format_impact_badge(impact_val):
+    parsed = parse_impact_percent_value(impact_val)
+    if parsed is not None:
+        if round(parsed, 1).is_integer():
+            txt = f"{parsed:.0f}%"
+        else:
+            txt = f"{parsed:.1f}%"
+        return html.Span(txt, className="rca-impact-pill")
     if impact_val is not None and pd.notna(impact_val):
-        try:
-            val_num = float(impact_val)
-            if 0 < val_num <= 1.0:
-                val_num = val_num * 100
-            txt = f"{val_num:.0f}%"
-            return html.Span(txt, className="rca-impact-pill")
-        except (ValueError, TypeError):
-            if str(impact_val).strip() and str(impact_val).strip() != "—":
-                return html.Span(str(impact_val).strip(), className="rca-impact-pill")
+        s = str(impact_val).strip()
+        if s and s not in {"—", "-", "none", "nan", "null"}:
+            disp = s if s.endswith("%") else f"{s}%"
+            return html.Span(disp, className="rca-impact-pill")
     return html.Span("—", className="rca-dash-text")
 
 
@@ -2725,7 +2749,7 @@ def create_pareto_chart(causes):
                     "line": {"color": "#19718d", "width": 1},
                 },
                 text=[
-                    f"{value:.0f}%"
+                    f"{value:.1f}%" if round(value, 1) % 1 != 0 else f"{value:.0f}%"
                     for value in chart_data["impact_percent"]
                 ],
                 textposition="outside",
@@ -2733,7 +2757,7 @@ def create_pareto_chart(causes):
                 customdata=chart_data["cause"],
                 hovertemplate=(
                     "<b>%{x}</b><br>%{customdata}"
-                    "<br>Impact on KPI gap: %{y:.0f}%<extra></extra>"
+                    "<br>Impact on KPI gap: %{y:.1f}%<extra></extra>"
                 ),
             )
         )
