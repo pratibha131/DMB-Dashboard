@@ -16,12 +16,18 @@ from openpyxl.utils.exceptions import InvalidFileException
 import pandas as pd
 import plotly.graph_objects as go
 
-from data_loader import load_dashboard_data, load_strategic_rca_actions
+from data_loader import load_dashboard_data, load_strategic_rca_actions, clean_text
 from kpi_calculations import (
     get_default_reporting_month,
     get_month_summary,
     prepare_kpi_data,
 )
+
+
+def clean_text(value):
+    if pd.isna(value):
+        return ""
+    return str(value).replace("\xa0", " ").strip()
 
 
 # =========================================================
