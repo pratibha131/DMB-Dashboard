@@ -90,6 +90,36 @@ def norm_key(s: Any) -> str:
     return re.sub(r"[^a-zA-Z0-9]", "", str(s or "").lower())
 
 
+def normalize_numeric_value(val: Any, target_aop: Any = None, units: str = "") -> Any:
+    if val is None:
+        return None
+    if isinstance(val, (int, float)):
+        return val
+    s = clean_text(val)
+    if not s or s.lower() in {"none", "nan", "null", "-", "qtr", "hy", "tbd", "n/a", "na"}:
+        return None
+    if "%" in s:
+        s_clean = s.replace("%", "").replace(",", "").strip()
+        try:
+            num = float(s_clean)
+            target_num = None
+            if target_aop is not None:
+                try:
+                    target_num = float(str(target_aop).replace("%", "").strip())
+                except Exception:
+                    pass
+            if (target_num is not None and target_num <= 1.5) or (target_num is None and num > 1.0):
+                if num > 1.0:
+                    num = num / 100.0
+            return num
+        except Exception:
+            return val
+    try:
+        return float(s.replace(",", ""))
+    except Exception:
+        return val
+
+
 def read_file_safe_bytes(file_path: Path | str) -> bytes:
     """Read file bytes safely on Windows even if open in Excel."""
     file_path = Path(file_path)
@@ -255,10 +285,10 @@ def extract_functional_kpis(func_wb: openpyxl.Workbook) -> List[Dict[str, Any]]:
                 metric_nature = clean_text(src_sheet.cell(r, 6).value)
                 frequency = clean_text(src_sheet.cell(r, 7).value)
 
-                t_months = [src_sheet.cell(r, month_col_idx.get(m_i, m_i + 9)).value for m_i in range(12)]
+                t_months = [normalize_numeric_value(src_sheet.cell(r, month_col_idx.get(m_i, m_i + 9)).value, target_aop, units) for m_i in range(12)]
                 a_months = [None] * 12
                 if r + 1 <= src_sheet.max_row and clean_text(src_sheet.cell(r + 1, 8).value).title() == "Actual":
-                    a_months = [src_sheet.cell(r + 1, month_col_idx.get(m_i, m_i + 9)).value for m_i in range(12)]
+                    a_months = [normalize_numeric_value(src_sheet.cell(r + 1, month_col_idx.get(m_i, m_i + 9)).value, target_aop, units) for m_i in range(12)]
                     next_step = 2
                 else:
                     next_step = 1

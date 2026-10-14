@@ -33,18 +33,69 @@ def get_default_reporting_month(data):
     return valid_months.max()
 
 
+def clean_numeric_column(df, col):
+    """
+    Safely parse Actual or Target column in KPI dataframe:
+    - handles numeric types directly
+    - handles strings with '%' (e.g. '35.2%', '90%%', '80%')
+    - determines whether KPI uses decimal scale [0, 1] (e.g. Win rate 0.40) or 0-100 (e.g. Sales tool 80)
+      and converts accordingly (35.2% -> 0.352, 90%% -> 0.90, 80% -> 80.0)
+    - converts non-numeric placeholders ('-', 'QTR', 'HY', 'TBD', etc.) to NaN
+    """
+    if col not in df.columns:
+        return pd.Series(index=df.index, dtype="float64")
+
+    kpi_is_decimal = {}
+    if "kpi_name" in df.columns:
+        for kpi, group in df.groupby("kpi_name"):
+            nums = []
+            for check_col in ["Target", "Actual", "target_aop_2026", "aop_2026"]:
+                if check_col in group.columns:
+                    for v in group[check_col]:
+                        if isinstance(v, (int, float)) and pd.notna(v):
+                            nums.append(float(v))
+                        elif isinstance(v, str) and not ("%" in v):
+                            try:
+                                nums.append(float(v.strip().replace(",", "")))
+                            except Exception:
+                                pass
+            if nums:
+                kpi_is_decimal[kpi] = max(nums) <= 1.5
+            else:
+                kpi_is_decimal[kpi] = False
+
+    cleaned = []
+    for idx, val in df[col].items():
+        if pd.isna(val):
+            cleaned.append(float("nan"))
+            continue
+        if isinstance(val, (int, float)):
+            cleaned.append(float(val))
+            continue
+        s = str(val).replace("\xa0", " ").strip()
+        if not s or s.lower() in {"none", "nan", "null", "-", "qtr", "hy", "tbd", "n/a", "na"}:
+            cleaned.append(float("nan"))
+            continue
+        has_pct = "%" in s
+        s_clean = s.replace("%", "").replace(",", "").strip()
+        try:
+            num = float(s_clean)
+            kpi_name = df.loc[idx, "kpi_name"] if "kpi_name" in df.columns and idx in df.index else ""
+            is_decimal = kpi_is_decimal.get(kpi_name, False)
+            if has_pct and num > 1.0 and is_decimal:
+                num = num / 100.0
+            cleaned.append(num)
+        except (ValueError, TypeError):
+            cleaned.append(float("nan"))
+
+    return pd.Series(cleaned, index=df.index, dtype="float64")
+
+
 def prepare_kpi_data(data, entity_columns):
     prepared = data.copy()
 
-    prepared["Actual"] = pd.to_numeric(
-        prepared["Actual"],
-        errors="coerce",
-    )
-
-    prepared["Target"] = pd.to_numeric(
-        prepared["Target"],
-        errors="coerce",
-    )
+    prepared["Actual"] = clean_numeric_column(prepared, "Actual")
+    prepared["Target"] = clean_numeric_column(prepared, "Target")
 
     metric_nature = (
         prepared["metric_nature"]
