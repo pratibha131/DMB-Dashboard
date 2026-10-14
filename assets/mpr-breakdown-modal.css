@@ -1,0 +1,299 @@
+/* =========================================================
+   OVERALL MOS KPI PERFORMANCE - BREAKDOWN MODAL STYLING
+   ========================================================= */
+
+.mpr-breakdown-modal {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 1050;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+    transition: opacity 0.22s cubic-bezier(0.16, 1, 0.3, 1), visibility 0.22s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.mpr-breakdown-modal.mpr-breakdown-modal-hidden {
+    opacity: 0;
+    visibility: hidden;
+    pointer-events: none;
+}
+
+.mpr-breakdown-modal-backdrop {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: rgba(15, 23, 42, 0.68);
+    backdrop-filter: blur(5px);
+    border: none;
+    cursor: pointer;
+    z-index: 1;
+}
+
+.mpr-breakdown-modal-dialog {
+    position: relative;
+    z-index: 2;
+    background: #ffffff;
+    border-radius: 14px;
+    box-shadow: 0 24px 60px rgba(0, 45, 75, 0.28), 0 4px 16px rgba(0, 0, 0, 0.08);
+    width: 100%;
+    max-width: 1240px;
+    max-height: 88vh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    animation: mprModalPopIn 0.22s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@keyframes mprModalPopIn {
+    from {
+        transform: scale(0.96) translateY(10px);
+        opacity: 0;
+    }
+    to {
+        transform: scale(1) translateY(0);
+        opacity: 1;
+    }
+}
+
+.mpr-breakdown-modal-header {
+    padding: 20px 24px 16px;
+    border-bottom: 1px solid #e2e8f0;
+    background: linear-gradient(180deg, #f8fafc 0%, #ffffff 100%);
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 16px;
+}
+
+.mpr-breakdown-eyebrow {
+    font-size: 11.5px;
+    font-weight: 800;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: #0b557f;
+    margin: 0 0 4px 0;
+}
+
+.mpr-breakdown-modal-title {
+    margin: 0;
+    font-size: 22px;
+    font-weight: 750;
+    color: #0f172a;
+    letter-spacing: -0.01em;
+}
+
+.mpr-breakdown-modal-subtitle {
+    margin: 4px 0 0;
+    font-size: 13.5px;
+    color: #64748b;
+    font-weight: 500;
+}
+
+.mpr-breakdown-modal-close {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 8px 16px;
+    border-radius: 8px;
+    border: 1px solid #cbd5e1;
+    background: #ffffff;
+    color: #334155;
+    font-size: 13.5px;
+    font-weight: 650;
+    cursor: pointer;
+    transition: all 0.18s ease;
+}
+
+.mpr-breakdown-modal-close:hover {
+    background: #f1f5f9;
+    border-color: #94a3b8;
+    color: #0f172a;
+}
+
+/* Pills row */
+.mpr-modal-pills-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+    padding: 12px 24px;
+    background: #f8fafc;
+    border-bottom: 1px solid #e2e8f0;
+}
+
+.mpr-modal-pill {
+    padding: 6px 14px;
+    border-radius: 20px;
+    font-size: 12.5px;
+    font-weight: 650;
+    border: 1px solid #cbd5e1;
+    background: #ffffff;
+    color: #475569;
+    cursor: pointer;
+    transition: all 0.15s ease;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.mpr-modal-pill:hover {
+    background: #e2e8f0;
+    color: #0f172a;
+}
+
+.mpr-modal-pill.mpr-pill-active {
+    background: #0b557f;
+    color: #ffffff;
+    border-color: #0b557f;
+    box-shadow: 0 2px 6px rgba(11, 85, 127, 0.25);
+}
+
+.mpr-modal-pill.mpr-pill-active.pill-met {
+    background: #168b69;
+    border-color: #168b69;
+}
+
+.mpr-modal-pill.mpr-pill-active.pill-not-met {
+    background: #dc3d56;
+    border-color: #dc3d56;
+}
+
+.mpr-modal-pill.mpr-pill-active.pill-improved {
+    background: #c18100;
+    border-color: #c18100;
+}
+
+.mpr-modal-pill.mpr-pill-active.pill-neither {
+    background: #dc3d56;
+    border-color: #dc3d56;
+}
+
+.mpr-modal-pill.mpr-pill-active.pill-outside {
+    background: #475569;
+    border-color: #475569;
+}
+
+/* Modal table */
+.mpr-breakdown-modal-body {
+    padding: 0;
+    overflow-y: auto;
+    max-height: calc(88vh - 170px);
+}
+
+.mpr-breakdown-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 14px;
+    table-layout: fixed;
+}
+
+.mpr-breakdown-table th {
+    position: sticky;
+    top: 0;
+    background: #0b557f;
+    color: #ffffff;
+    font-weight: 700;
+    font-size: 13.5px;
+    padding: 12px 16px;
+    text-align: left;
+    border-right: 1px solid rgba(255, 255, 255, 0.15);
+    z-index: 10;
+}
+
+.mpr-breakdown-table th:last-child {
+    border-right: 0;
+}
+
+.mpr-breakdown-table th:nth-child(1) { width: 20%; }
+.mpr-breakdown-table th:nth-child(2) { width: 22%; }
+.mpr-breakdown-table th:nth-child(3) { width: 10%; }
+.mpr-breakdown-table th:nth-child(4) { width: 9%; }
+.mpr-breakdown-table th:nth-child(5) { width: 9%; }
+.mpr-breakdown-table th:nth-child(6) { width: 12%; }
+.mpr-breakdown-table th:nth-child(7) { width: 18%; }
+
+.mpr-breakdown-table td {
+    padding: 12px 16px;
+    border-bottom: 1px solid #e2e8f0;
+    border-right: 1px solid #f1f5f9;
+    color: #1e293b;
+    vertical-align: middle;
+    font-size: 13.5px;
+}
+
+.mpr-breakdown-table td:last-child {
+    border-right: 0;
+}
+
+.mpr-breakdown-table tbody tr:hover td {
+    background: #f8fafc;
+}
+
+.mpr-badge {
+    display: inline-block;
+    padding: 4px 10px;
+    border-radius: 12px;
+    font-size: 12px;
+    font-weight: 700;
+    white-space: nowrap;
+    text-align: center;
+}
+
+.mpr-badge-met {
+    background: #dcfce7;
+    color: #15803d;
+}
+
+.mpr-badge-not-met {
+    background: #fee2e2;
+    color: #b91c1c;
+}
+
+.mpr-badge-improved {
+    background: #fef3c7;
+    color: #b45309;
+}
+
+.mpr-badge-neither {
+    background: #ffe4e6;
+    color: #be123c;
+}
+
+.mpr-badge-outside {
+    background: #f1f5f9;
+    color: #475569;
+    border: 1px dashed #cbd5e1;
+}
+
+.mpr-target-text {
+    font-weight: 700;
+    color: #1e293b;
+}
+
+.mpr-actual-text-met {
+    font-weight: 800;
+    color: #168b69;
+}
+
+.mpr-actual-text-red {
+    font-weight: 800;
+    color: #dc3d56;
+}
+
+.mpr-actual-text-neutral {
+    font-weight: 600;
+    color: #64748b;
+}
+
+.mpr-empty-state {
+    padding: 48px 24px;
+    text-align: center;
+    color: #64748b;
+    font-size: 15px;
+}

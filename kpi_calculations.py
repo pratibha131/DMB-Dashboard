@@ -233,7 +233,10 @@ def get_month_summary(data, reporting_month):
         & current_month["Target"].notna()
     ]
 
-    total_kpis = len(valid)
+    total_all_kpis = len(current_month)
+    valid_total = len(valid)
+    outside_kpis = total_all_kpis - valid_total
+
     met = int(valid["is_met"].sum())
     not_met = int(valid["status"].eq("Not Met").sum())
     improved = int(valid["is_improved"].sum())
@@ -246,8 +249,8 @@ def get_month_summary(data, reporting_month):
     )
 
     performance_percentage = (
-        met_or_improved / total_kpis * 100
-        if total_kpis
+        met_or_improved / valid_total * 100
+        if valid_total
         else 0
     )
 
@@ -268,7 +271,9 @@ def get_month_summary(data, reporting_month):
     )
 
     return {
-        "total_kpis": total_kpis,
+        "total_kpis": total_all_kpis,
+        "valid_kpis": valid_total,
+        "outside_kpis": outside_kpis,
         "met": met,
         "not_met": not_met,
         "improved": improved,

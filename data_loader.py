@@ -900,6 +900,7 @@ def load_strategic_rca_actions(excel_path=None):
                     "reporting_month": m_ts,
                     "strategic_imperative": current_strat,
                     "kpi_name": kpi_name,
+                    "units": unit_str,
                     "target": t_num,
                     "actual": a_num,
                     "is_red": is_red,
