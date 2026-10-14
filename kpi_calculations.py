@@ -135,28 +135,20 @@ def prepare_kpi_data(data, entity_columns):
         "status",
     ] = "Not Met"
 
-    # Bring the previous month's result beside the current month
-    previous_month = prepared[
-        entity_columns + ["month", "Actual", "status"]
-    ].copy()
+    # Bring the last filled month's result beside the current month
+    # This correctly handles Monthly, Quarterly, Half-Yearly, and sporadic reporting
+    prepared = prepared.sort_values(entity_columns + ["month"]).reset_index(drop=True)
 
-    previous_month["month"] = (
-        previous_month["month"]
-        + pd.DateOffset(months=1)
-    )
+    prepared["previous_actual"] = pd.Series(float("nan"), index=prepared.index, dtype="float64")
+    prepared["previous_status"] = pd.Series(None, index=prepared.index, dtype="object")
+    prepared["previous_month"] = pd.Series(pd.NaT, index=prepared.index, dtype="datetime64[ns]")
 
-    previous_month = previous_month.rename(
-        columns={
-            "Actual": "previous_actual",
-            "status": "previous_status",
-        }
-    )
-
-    prepared = prepared.merge(
-        previous_month,
-        on=entity_columns + ["month"],
-        how="left",
-    )
+    for _, grp in prepared.groupby(entity_columns, sort=False):
+        valid_idx = grp[grp["Actual"].notna()].index
+        if len(valid_idx) > 1:
+            prepared.loc[valid_idx, "previous_actual"] = grp.loc[valid_idx, "Actual"].shift(1)
+            prepared.loc[valid_idx, "previous_status"] = grp.loc[valid_idx, "status"].shift(1)
+            prepared.loc[valid_idx, "previous_month"] = grp.loc[valid_idx, "month"].shift(1)
 
     comparable = (
         prepared["Actual"].notna()
