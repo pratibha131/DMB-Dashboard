@@ -1665,22 +1665,27 @@ def create_function_card(function_name, current_data):
                 current_data["function"].isin(["ISC & Procurement", "ISC", "Procurement"])
             ].copy()
             known_kpis = set(
-                active_dmb[
+                k for k in active_dmb[
                     active_dmb["function"].isin(["ISC & Procurement", "ISC", "Procurement"])
                 ]["kpi_name"].dropna().unique()
+                if clean_text(k)
             ) if not active_dmb.empty and "function" in active_dmb.columns else set()
         else:
             function_rows = current_data[current_data["function"].eq(function_name)].copy()
             known_kpis = set(
-                active_dmb[
+                k for k in active_dmb[
                     active_dmb["function"].eq(function_name)
                 ]["kpi_name"].dropna().unique()
+                if clean_text(k)
             ) if not active_dmb.empty and "function" in active_dmb.columns else set()
     else:
         function_rows = pd.DataFrame()
         known_kpis = set()
 
-    month_kpis = set(function_rows["kpi_name"].dropna().unique()) if not function_rows.empty and "kpi_name" in function_rows.columns else set()
+    month_kpis = set(
+        k for k in function_rows["kpi_name"].dropna().unique()
+        if clean_text(k)
+    ) if not function_rows.empty and "kpi_name" in function_rows.columns else set()
     all_kpis = known_kpis.union(month_kpis)
     total_expected = max(len(all_kpis), len(function_rows))
 

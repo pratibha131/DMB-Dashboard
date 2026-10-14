@@ -276,8 +276,11 @@ def extract_functional_kpis(func_wb: openpyxl.Workbook) -> List[Dict[str, Any]]:
             if any(stop in c1.lower() for stop in ["root cause", "action tracker", "paretos", "trends", "if the kpi"]):
                 break
 
-            if c8 == "Target" or (c1 and r + 1 <= src_sheet.max_row and clean_text(src_sheet.cell(r + 1, 8).value).title() == "Actual"):
+            if c1 and (c8 == "Target" or (r + 1 <= src_sheet.max_row and clean_text(src_sheet.cell(r + 1, 8).value).title() == "Actual")):
                 kpi_name = c1
+                if not kpi_name or kpi_name.lower() in {"kpi name", "mandatory kpi", "core kpi", "trends", "trends-"}:
+                    r += 1
+                    continue
                 definition = clean_text(src_sheet.cell(r, 2).value)
                 operator = clean_text(src_sheet.cell(r, 3).value)
                 target_aop = src_sheet.cell(r, 4).value
@@ -472,6 +475,8 @@ def sync_masterfile(
                         val = m_vals[m_i]
                         if val is not None and str(val).strip() != "":
                             dmb_dst_sheet.cell(r, m_i + 9, val)
+                        else:
+                            dmb_dst_sheet.cell(r, m_i + 9, None)
 
                     if src_kpi["data_type"]:
                         dmb_dst_sheet.cell(r, 21, src_kpi["data_type"])

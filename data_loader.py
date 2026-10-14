@@ -290,6 +290,7 @@ def load_mpr_data_from_strategic(excel_path=None):
                 break
 
     current_strat = ""
+    current_kpi_name = ""
     records = []
 
     for r in range(header_row_idx + 1, len(raw)):
@@ -315,8 +316,14 @@ def load_mpr_data_from_strategic(excel_path=None):
         if t_or_a == "T":
             kpi_val = raw.iloc[r, 1] if raw.shape[1] > 1 else ""
             kpi_name = clean_text(kpi_val)
+            kpi_def = clean_text(raw.iloc[r, 3] if raw.shape[1] > 3 else "")
+            if not kpi_name and current_kpi_name:
+                kpi_name = current_kpi_name
+            elif not kpi_name and kpi_def:
+                kpi_name = kpi_def
             if not kpi_name or kpi_name.lower().startswith("value lever") or kpi_name.lower().startswith("kpi "):
                 continue
+            current_kpi_name = kpi_name
 
             owner = clean_text(raw.iloc[r, 2] if raw.shape[1] > 2 else "")
             kpi_def = clean_text(raw.iloc[r, 3] if raw.shape[1] > 3 else "")
@@ -533,6 +540,9 @@ def load_dmb_data(excel_path=EXCEL_PATH):
         row_type = clean_text(raw.iat[row_number, 7]).lower() if raw.shape[1] > 7 else ""
 
         if row_type not in {"target", "actual"}:
+            continue
+
+        if not first_cell or first_cell.lower() in {"kpi name", "mastersheet", "mandatory kpi", "core kpi", "trends", "trends-"}:
             continue
 
         series_name = row_type.title()
@@ -1038,21 +1048,42 @@ class DMBDataStore:
                 from kpi_calculations import prepare_kpi_data
                 master_file = find_masterfile()
 
-                # Automatically consolidate if source files in data/ are newer than Masterfile
+                strat_p = BASE_DIR / "data" / "Strategic Execution Dashboard.xlsx"
+                func_p = BASE_DIR / "data" / "Functional DMB Review Sheets.xlsx"
+
+                source_sigs = {}
+                for p in [strat_p, func_p]:
+                    if p.exists():
+                        try:
+                            st = p.stat()
+                            source_sigs[p.name] = (st.st_mtime_ns, st.st_size)
+                        except OSError:
+                            pass
+
+                prev_source_sigs = getattr(self, "_source_sigs", None)
+                needs_sync = False
+                if source_sigs and (source_sigs != prev_source_sigs):
+                    needs_sync = True
+                elif force and (strat_p.exists() or func_p.exists()):
+                    needs_sync = True
+
                 if master_file and master_file.exists():
-                    strat_p = BASE_DIR / "data" / "Strategic Execution Dashboard.xlsx"
-                    func_p = BASE_DIR / "data" / "Functional DMB Review Sheets.xlsx"
                     m_mtime = master_file.stat().st_mtime
                     if (strat_p.exists() and strat_p.stat().st_mtime > m_mtime) or (func_p.exists() and func_p.stat().st_mtime > m_mtime):
-                        try:
-                            from scripts.sync_to_masterfile import sync_masterfile
-                            sync_masterfile(
-                                func_path=func_p if func_p.exists() else None,
-                                strat_path=strat_p if strat_p.exists() else None,
-                                target_path=master_file,
-                            )
-                        except Exception as sync_err:
-                            print(f"[DMBDataStore Auto-Consolidate Notice] {sync_err}")
+                        needs_sync = True
+
+                if needs_sync and master_file:
+                    try:
+                        from scripts.sync_to_masterfile import sync_masterfile
+                        sync_res = sync_masterfile(
+                            func_path=func_p if func_p.exists() else None,
+                            strat_path=strat_p if strat_p.exists() else None,
+                            target_path=master_file,
+                        )
+                        if sync_res.get("success"):
+                            self._source_sigs = source_sigs
+                    except Exception as sync_err:
+                        print(f"[DMBDataStore Auto-Consolidate Notice] {sync_err}")
 
                 if master_file and master_file.exists():
                     mpr_raw, dmb_raw = load_dashboard_data(master_file)
