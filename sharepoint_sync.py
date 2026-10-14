@@ -18,6 +18,7 @@ import io
 import json
 import logging
 import os
+import re
 from pathlib import Path
 import shutil
 import threading
@@ -352,18 +353,35 @@ class SharePointSyncManager:
         found_files: Dict[str, Path] = {}
 
         for root_dir in search_dirs:
+            is_downloads = "download" in root_dir.name.lower() or "downloads" in str(root_dir).lower()
             for key, patterns in self.config.get("file_match_patterns", {}).items():
                 if key in found_files:
                     continue
+                # Do not scan Downloads for canonical masterfile (Downloads contains stale exported reports)
+                if key == "masterfile" and is_downloads:
+                    continue
                 for pattern in patterns:
+                    candidates = [
+                        p for p in root_dir.glob(pattern)
+                        if not p.name.startswith("~$")
+                        and p.is_file()
+                        # Exclude duplicate numbered download copies like " (1).xlsx", " (2).xlsx", " (3).xlsx"
+                        and not re.search(r"\s*\(\d+\)", p.stem)
+                    ]
                     candidates = sorted(
-                        [p for p in root_dir.glob(pattern) if not p.name.startswith("~$") and p.is_file()],
+                        candidates,
                         key=lambda p: p.stat().st_mtime if p.exists() else 0,
                         reverse=True,
                     )
                     if not candidates and (root_dir / "Documents").exists():
+                        doc_cands = [
+                            p for p in (root_dir / "Documents").glob(pattern)
+                            if not p.name.startswith("~$")
+                            and p.is_file()
+                            and not re.search(r"\s*\(\d+\)", p.stem)
+                        ]
                         candidates = sorted(
-                            [p for p in (root_dir / "Documents").glob(pattern) if not p.name.startswith("~$") and p.is_file()],
+                            doc_cands,
                             key=lambda p: p.stat().st_mtime if p.exists() else 0,
                             reverse=True,
                         )
@@ -455,6 +473,10 @@ class SharePointSyncManager:
             if not content and key in local_files:
                 local_path = local_files[key]
                 try:
+                    # Guard: Never overwrite an existing file in data/ with an older source file!
+                    if target_path.exists():
+                        if local_path.stat().st_mtime < target_path.stat().st_mtime:
+                            continue
                     content = read_file_safe_bytes(local_path)
                     source_desc = f"Local Synced SharePoint ({local_path.name})"
                 except Exception as e:
@@ -477,23 +499,40 @@ class SharePointSyncManager:
                 else:
                     synced_sources[target_name] = f"Up to date ({source_desc})"
 
-        # 3. Auto-Consolidate Masterfile if Functional Review or Strategic Execution was updated
+        # 3. Auto-Consolidate Masterfile whenever Functional Review or Strategic Execution is newer
         func_file_name = TARGET_FILENAMES["functional_review"]
         strat_file_name = TARGET_FILENAMES["strategic_execution"]
         master_file_name = TARGET_FILENAMES["masterfile"]
 
-        if (func_file_name in updated_files or strat_file_name in updated_files) and master_file_name not in updated_files:
+        strat_p = DATA_DIR / strat_file_name
+        func_p = DATA_DIR / func_file_name
+        master_p = DATA_DIR / master_file_name
+
+        m_mtime = master_p.stat().st_mtime if master_p.exists() else 0.0
+        sources_need_consolidation = (
+            func_file_name in updated_files
+            or strat_file_name in updated_files
+            or (strat_p.exists() and strat_p.stat().st_mtime > m_mtime)
+            or (func_p.exists() and func_p.stat().st_mtime > m_mtime)
+            or not master_p.exists()
+        )
+
+        if sources_need_consolidation:
             try:
                 from scripts.sync_to_masterfile import sync_masterfile
-                sync_res = sync_masterfile()
+                sync_res = sync_masterfile(
+                    func_path=func_p if func_p.exists() else None,
+                    strat_path=strat_p if strat_p.exists() else None,
+                    target_path=master_p,
+                )
                 if sync_res.get("success"):
-                    updated_files.append(master_file_name)
+                    if master_file_name not in updated_files:
+                        updated_files.append(master_file_name)
                     synced_sources[master_file_name] = "Auto-Consolidated from Updated Functional/Strategic Files"
-                    m_path = DATA_DIR / master_file_name
-                    if m_path.exists():
-                        self._file_hashes[master_file_name] = get_file_sha256(read_file_safe_bytes(m_path))
+                    if master_p.exists():
+                        self._file_hashes[master_file_name] = get_file_sha256(read_file_safe_bytes(master_p))
                         # Also push to GitHub if configured
-                        email_sync.push_to_github_if_configured(master_file_name, read_file_safe_bytes(m_path))
+                        email_sync.push_to_github_if_configured(master_file_name, read_file_safe_bytes(master_p))
                     logger.info("Auto-consolidated %s after source files updated.", master_file_name)
             except Exception as e:
                 errors.append(f"Auto-consolidation error: {e}")

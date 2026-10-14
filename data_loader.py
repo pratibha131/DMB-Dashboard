@@ -1037,6 +1037,23 @@ class DMBDataStore:
             try:
                 from kpi_calculations import prepare_kpi_data
                 master_file = find_masterfile()
+
+                # Automatically consolidate if source files in data/ are newer than Masterfile
+                if master_file and master_file.exists():
+                    strat_p = BASE_DIR / "data" / "Strategic Execution Dashboard.xlsx"
+                    func_p = BASE_DIR / "data" / "Functional DMB Review Sheets.xlsx"
+                    m_mtime = master_file.stat().st_mtime
+                    if (strat_p.exists() and strat_p.stat().st_mtime > m_mtime) or (func_p.exists() and func_p.stat().st_mtime > m_mtime):
+                        try:
+                            from scripts.sync_to_masterfile import sync_masterfile
+                            sync_masterfile(
+                                func_path=func_p if func_p.exists() else None,
+                                strat_path=strat_p if strat_p.exists() else None,
+                                target_path=master_file,
+                            )
+                        except Exception as sync_err:
+                            print(f"[DMBDataStore Auto-Consolidate Notice] {sync_err}")
+
                 if master_file and master_file.exists():
                     mpr_raw, dmb_raw = load_dashboard_data(master_file)
                     self._mpr_raw = mpr_raw
@@ -1045,7 +1062,7 @@ class DMBDataStore:
                     self._dmb_data = prepare_kpi_data(dmb_raw, ["function", "kpi_name"])
 
                 self._strat_rca = load_strategic_rca_actions()
-                self._signature = current_sig
+                self._signature = data_folder_signature()
                 self._last_loaded = time.time()
                 return True
             except Exception as e:
