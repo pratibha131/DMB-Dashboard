@@ -1178,13 +1178,13 @@ def get_dynamic_reporting_months(data=None, rca_actions_df=None, reference_date=
     """
     Returns (available_months, default_month) dynamically:
     - Automatically includes all completed months from January of the year up to
-      the target reporting month (current month - 2).
-      (e.g. in October 2026 -> Jan-Aug 2026;
-       when November 2026 starts -> Jan-Sep 2026 automatically).
-    - Capped at the target reporting month (current month - 2).
-    - Plus any historical months with actual data present in the dataset (up to current month - 2).
-    - Plus any historical months present in strategic/functional RCA actions (up to current month - 2).
-    - Default month is current month - 2.
+      the target reporting month (current month - 1).
+      (e.g. in October 2026 -> Jan-Sep 2026;
+       when November 2026 starts -> Jan-Oct 2026 automatically).
+    - Capped at the target reporting month (current month - 1).
+    - Plus any historical months with actual data present in the dataset (up to current month - 1).
+    - Plus any historical months present in strategic/functional RCA actions (up to current month - 1).
+    - Default month is current month - 1.
     """
     if reference_date is None:
         ref_dt = pd.Timestamp.now()
@@ -1192,7 +1192,7 @@ def get_dynamic_reporting_months(data=None, rca_actions_df=None, reference_date=
         ref_dt = pd.Timestamp(reference_date)
 
     current_month_start = pd.Timestamp(year=ref_dt.year, month=ref_dt.month, day=1)
-    latest_completed_month = (current_month_start - pd.DateOffset(months=2)).floor("D")
+    latest_completed_month = (current_month_start - pd.DateOffset(months=1)).floor("D")
 
     start_year_month = pd.Timestamp(year=latest_completed_month.year, month=1, day=1)
     start_month = start_year_month
@@ -3809,13 +3809,16 @@ def get_mpr_dashboard_content(month_value):
 
     highlight_text, lowlight_text, concern_text = get_strategic_executive_insights(selected_month)
 
+    # For "KPIs met & improved" gauge, take only monthly KPIs while keeping other cards/metrics intact
+    gauge_percentage = summary.get("monthly_performance_percentage", summary["performance_percentage"])
+
     return (
         summary["total_kpis"],
         summary["met"],
         summary["not_met"],
         summary["improved"],
         summary["neither"],
-        create_gauge(summary["performance_percentage"]),
+        create_gauge(gauge_percentage),
         create_imperative_chart(current),
         selected_month.strftime("%B %Y"),
         create_trend_chart(selected_month),

@@ -208,6 +208,22 @@ def get_month_summary(data, reporting_month):
         else 0
     )
 
+    # Monthly-only KPI calculation for "KPIs met & improved" gauge
+    if "frequency" in valid.columns:
+        monthly_valid = valid[
+            valid["frequency"].fillna("").astype(str).str.strip().str.lower().eq("monthly")
+        ]
+    else:
+        monthly_valid = valid
+
+    monthly_total = len(monthly_valid)
+    monthly_met_or_improved = int(monthly_valid["is_met_or_improved"].sum()) if monthly_total else 0
+    monthly_performance_percentage = (
+        monthly_met_or_improved / monthly_total * 100
+        if monthly_total
+        else 0
+    )
+
     return {
         "total_kpis": total_kpis,
         "met": met,
@@ -217,6 +233,9 @@ def get_month_summary(data, reporting_month):
         "neither": neither,
         "continuous_red": continuous_red,
         "performance_percentage": performance_percentage,
+        "monthly_total": monthly_total,
+        "monthly_met_or_improved": monthly_met_or_improved,
+        "monthly_performance_percentage": monthly_performance_percentage,
     }
 
 
