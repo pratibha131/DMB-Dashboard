@@ -462,15 +462,15 @@ def load_mpr_data(excel_path=None):
         )
 
         for column, month_name in month_headers.items():
-            value = raw.iat[row_number, column]
-
-            if not month_name or pd.isna(value):
+            if not month_name:
                 continue
 
             month_date = parse_month_label(month_name, reporting_year)
 
             if pd.isna(month_date):
                 continue
+
+            value = raw.iat[row_number, column]
 
             records.append(
                 {

@@ -3852,7 +3852,6 @@ def get_mpr_dashboard_content(month_value):
         summary["not_met"],
         summary["improved"],
         summary["neither"],
-        summary.get("outside_kpis", 0),
         create_gauge(gauge_percentage),
         create_imperative_chart(current),
         selected_month.strftime("%B %Y"),
@@ -4509,7 +4508,7 @@ def get_function_kpis_trend_modal_content(function_name, month_value, active_kpi
     return create_function_kpis_table_detail(function_name, selected_month)
 
 
-def create_mpr_breakdown_pills(summary, active_filter="outside"):
+def create_mpr_breakdown_pills(summary, active_filter="all"):
     pills_config = [
         ("all", "All Critical KPIs", summary.get("total_kpis", 0), "pill-all"),
         ("met", "KPIs Met", summary.get("met", 0), "pill-met"),
@@ -4539,7 +4538,7 @@ def create_mpr_breakdown_pills(summary, active_filter="outside"):
     return pills
 
 
-def get_mpr_kpis_breakdown_modal_content(month_value, filter_type="outside"):
+def get_mpr_kpis_breakdown_modal_content(month_value, filter_type="all"):
     selected_month = pd.Timestamp(month_value)
     mpr_data = get_active_mpr_data()
     current = mpr_data[mpr_data["month"].eq(selected_month)].copy()
@@ -4554,12 +4553,16 @@ def get_mpr_kpis_breakdown_modal_content(month_value, filter_type="outside"):
         )
 
     # Filter data based on filter_type
-    filter_type = filter_type or "outside"
+    filter_type = filter_type or "all"
     if filter_type == "met":
         sub_df = current[current["is_met"]].copy()
         title_suffix = "KPIs Met"
     elif filter_type == "not_met":
-        sub_df = current[current["status"].eq("Not Met")].copy()
+        sub_df = current[
+            current["status"].eq("Not Met")
+            | current["Target"].isna()
+            | current["Actual"].isna()
+        ].copy()
         title_suffix = "KPIs Not Met"
     elif filter_type == "improved":
         sub_df = current[current["is_improved"]].copy()
@@ -4594,34 +4597,8 @@ def get_mpr_kpis_breakdown_modal_content(month_value, filter_type="outside"):
             t_disp = format_kpi_metric_display(t_raw, unit=u)
             a_disp = format_kpi_metric_display(a_raw, unit=u)
 
-            is_no_data = pd.isna(t_raw) or pd.isna(a_raw)
-            if is_no_data:
-                freq_l = freq.lower()
-                if "quarter" in freq_l:
-                    badge = html.Span("Reported Quarterly (QTR)", className="mpr-badge mpr-badge-outside")
-                    note = "Quarterly reporting cycle (QTR) — not reported monthly"
-                elif "half" in freq_l:
-                    badge = html.Span("Reported Half-Yearly (HY)", className="mpr-badge mpr-badge-outside")
-                    note = "Half-yearly reporting cycle (HY) — not reported monthly"
-                elif pd.isna(t_raw) and pd.notna(a_raw):
-                    badge = html.Span("Target Not Set", className="mpr-badge mpr-badge-outside")
-                    note = "Actual is available but Target is not configured in review sheet"
-                else:
-                    badge = html.Span("No Data", className="mpr-badge mpr-badge-outside")
-                    note = "No target or actual provided for this reporting month"
-                actual_class = "mpr-actual-text-neutral"
-            elif r.get("is_met"):
-                badge = html.Span("Met", className="mpr-badge mpr-badge-met")
-                note = "Met or exceeded target"
-                actual_class = "mpr-actual-text-met"
-            elif r.get("is_neither"):
-                badge = html.Span("Neither", className="mpr-badge mpr-badge-neither")
-                note = "Declined from last reported month and below target"
-                actual_class = "mpr-actual-text-red"
-            else:
-                badge = html.Span("Not Met", className="mpr-badge mpr-badge-not-met")
-                note = "Below target"
-                actual_class = "mpr-actual-text-red"
+            is_met = pd.notna(r.get("is_met")) and bool(r.get("is_met"))
+            actual_class = "mpr-actual-text-met" if is_met else "mpr-actual-text-red"
 
             rows.append(
                 html.Tr(
@@ -4631,8 +4608,6 @@ def get_mpr_kpis_breakdown_modal_content(month_value, filter_type="outside"):
                         html.Td(freq, className="mpr-freq-td"),
                         html.Td(t_disp or "—", className="mpr-target-td mpr-target-text"),
                         html.Td(a_disp or "—", className=f"mpr-actual-td {actual_class}"),
-                        html.Td(badge, className="mpr-status-td"),
-                        html.Td(note, className="mpr-note-td"),
                     ]
                 )
             )
@@ -4647,8 +4622,6 @@ def get_mpr_kpis_breakdown_modal_content(month_value, filter_type="outside"):
                             html.Th("Frequency"),
                             html.Th("Target"),
                             html.Th("Actual"),
-                            html.Th("Status"),
-                            html.Th("Details / Reason"),
                         ]
                     )
                 ),
@@ -4760,7 +4733,7 @@ def serve_layout():
                                 "Highlights & Lowlights of KPIs at MoS Level"
                             ),
                             html.Span(
-                                mpr_init[10],
+                                mpr_init[9],
                                 id="insights-reporting-month",
                                 className="insights-month",
                             ),
@@ -4774,24 +4747,24 @@ def serve_layout():
                                 "highlights-content",
                                 "highlights-count",
                                 "highlight-card",
-                                initial_content=mpr_init[11],
-                                initial_count=mpr_init[12],
+                                initial_content=mpr_init[10],
+                                initial_count=mpr_init[11],
                             ),
                             insight_card(
                                 "Lowlights",
                                 "lowlights-content",
                                 "lowlights-count",
                                 "lowlight-card",
-                                initial_content=mpr_init[13],
-                                initial_count=mpr_init[14],
+                                initial_content=mpr_init[12],
+                                initial_count=mpr_init[13],
                             ),
                             insight_card(
                                 "Concerns",
                                 "concerns-content",
                                 "concerns-count",
                                 "concern-card",
-                                initial_content=mpr_init[15],
-                                initial_count=mpr_init[16],
+                                initial_content=mpr_init[14],
+                                initial_count=mpr_init[15],
                             ),
                         ],
                         className="executive-insights",
@@ -4861,16 +4834,8 @@ def serve_layout():
                                         is_clickable=True,
                                         title="Click to view Neither improved nor met KPIs table",
                                     ),
-                                    kpi_card(
-                                        "KPIs without data",
-                                        "mpr-outside-kpis",
-                                        "#64748b",
-                                        initial_value=mpr_init[5],
-                                        is_clickable=True,
-                                        title="Click to view KPIs without data or reported quarterly/half-yearly",
-                                    ),
                                 ],
-                                className="kpi-summary-group kpi-summary-group-3",
+                                className="kpi-summary-group kpi-summary-group-2",
                             ),
                         ],
                         className="kpi-summary-grid",
@@ -4891,7 +4856,7 @@ def serve_layout():
                                     ),
                                     dcc.Graph(
                                         id="mpr-gauge",
-                                        figure=mpr_init[6],
+                                        figure=mpr_init[5],
                                         config={"displayModeBar": False},
                                     ),
                                 ],
@@ -4905,7 +4870,7 @@ def serve_layout():
                                                 "Strategic imperative performance"
                                             ),
                                             html.Span(
-                                                mpr_init[8],
+                                                mpr_init[7],
                                                 id="imperative-month",
                                                 className="chart-note",
                                             ),
@@ -4914,7 +4879,7 @@ def serve_layout():
                                     ),
                                     dcc.Graph(
                                         id="mpr-imperative-chart",
-                                        figure=mpr_init[7],
+                                        figure=mpr_init[6],
                                         config={
                                              "displayModeBar": False,
                                              "scrollZoom": False,
@@ -4933,7 +4898,7 @@ def serve_layout():
                                     ),
                                     dcc.Graph(
                                         id="mpr-trend-chart",
-                                        figure=mpr_init[9],
+                                        figure=mpr_init[8],
                                         config={"displayModeBar": False},
                                     ),
                                 ],
@@ -5284,7 +5249,6 @@ def sync_all_month_filters(mpr_val, dmb_val):
     Output("mpr-not-met-kpis", "children"),
     Output("mpr-improved-kpis", "children"),
     Output("mpr-neither-kpis", "children"),
-    Output("mpr-outside-kpis", "children"),
     Output("mpr-gauge", "figure"),
     Output("mpr-imperative-chart", "figure"),
     Output("imperative-month", "children"),
@@ -5651,7 +5615,6 @@ def manage_function_gauge_modal(
     Input("card-mpr-not-met-kpis", "n_clicks"),
     Input("card-mpr-improved-kpis", "n_clicks"),
     Input("card-mpr-neither-kpis", "n_clicks"),
-    Input("card-mpr-outside-kpis", "n_clicks"),
     Input({"type": "mpr-modal-pill", "filter": ALL}, "n_clicks"),
     Input("close-mpr-breakdown-modal", "n_clicks"),
     Input("mpr-breakdown-modal-backdrop", "n_clicks"),
@@ -5665,7 +5628,6 @@ def manage_mpr_breakdown_modal(
     not_met_clicks,
     improved_clicks,
     neither_clicks,
-    outside_clicks,
     pill_clicks,
     close_clicks,
     backdrop_clicks,
@@ -5676,7 +5638,7 @@ def manage_mpr_breakdown_modal(
     if not ctx_inst or not ctx_inst.triggered:
         raise PreventUpdate
 
-    current_state = current_state or {"is_open": False, "filter": "outside", "month": None}
+    current_state = current_state or {"is_open": False, "filter": "all", "month": None}
     selected_month = month_val or current_state.get("month") or default_month.strftime("%Y-%m-%d")
     trig_id = getattr(dash.ctx, "triggered_id", None)
 
@@ -5688,12 +5650,12 @@ def manage_mpr_breakdown_modal(
             no_update,
             no_update,
             no_update,
-            {"is_open": False, "filter": current_state.get("filter", "outside"), "month": selected_month},
+            {"is_open": False, "filter": current_state.get("filter", "all"), "month": selected_month},
         )
 
     # 2. Pill button clicked inside modal
     if isinstance(trig_id, dict) and trig_id.get("type") == "mpr-modal-pill":
-        active_f = trig_id.get("filter", "outside")
+        active_f = trig_id.get("filter", "all")
         title, subtitle, pills, body = get_mpr_kpis_breakdown_modal_content(selected_month, active_f)
         return (
             "mpr-breakdown-modal",
@@ -5706,9 +5668,7 @@ def manage_mpr_breakdown_modal(
 
     # 3. Card clicked on dashboard
     target_filter = None
-    if trig_id == "card-mpr-outside-kpis" and outside_clicks:
-        target_filter = "outside"
-    elif trig_id == "card-mpr-neither-kpis" and neither_clicks:
+    if trig_id == "card-mpr-neither-kpis" and neither_clicks:
         target_filter = "neither"
     elif trig_id == "card-mpr-improved-kpis" and improved_clicks:
         target_filter = "improved"
@@ -5722,7 +5682,7 @@ def manage_mpr_breakdown_modal(
     # 4. Month filter changed while modal is open
     if trig_id == "mpr-month-filter":
         if current_state.get("is_open"):
-            target_filter = current_state.get("filter", "outside")
+            target_filter = current_state.get("filter", "all")
         else:
             raise PreventUpdate
 

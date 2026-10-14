@@ -238,7 +238,7 @@ def get_month_summary(data, reporting_month):
     outside_kpis = total_all_kpis - valid_total
 
     met = int(valid["is_met"].sum())
-    not_met = int(valid["status"].eq("Not Met").sum())
+    not_met = int(valid["status"].eq("Not Met").sum()) + int(outside_kpis)
     improved = int(valid["is_improved"].sum())
     met_or_improved = int(
         valid["is_met_or_improved"].sum()
@@ -248,9 +248,10 @@ def get_month_summary(data, reporting_month):
         valid["is_continuous_red"].sum()
     )
 
+    # Performance percentage across all 3 frequencies (all critical KPIs, including without data)
     performance_percentage = (
-        met_or_improved / valid_total * 100
-        if valid_total
+        met_or_improved / total_all_kpis * 100
+        if total_all_kpis
         else 0
     )
 
