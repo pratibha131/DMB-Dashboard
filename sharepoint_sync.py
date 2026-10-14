@@ -357,16 +357,11 @@ class SharePointSyncManager:
             for key, patterns in self.config.get("file_match_patterns", {}).items():
                 if key in found_files:
                     continue
-                # Do not scan Downloads for canonical masterfile (Downloads contains stale exported reports)
-                if key == "masterfile" and is_downloads:
-                    continue
                 for pattern in patterns:
                     candidates = [
                         p for p in root_dir.glob(pattern)
                         if not p.name.startswith("~$")
                         and p.is_file()
-                        # Exclude duplicate numbered download copies like " (1).xlsx", " (2).xlsx", " (3).xlsx"
-                        and not re.search(r"\s*\(\d+\)", p.stem)
                     ]
                     candidates = sorted(
                         candidates,
@@ -378,7 +373,6 @@ class SharePointSyncManager:
                             p for p in (root_dir / "Documents").glob(pattern)
                             if not p.name.startswith("~$")
                             and p.is_file()
-                            and not re.search(r"\s*\(\d+\)", p.stem)
                         ]
                         candidates = sorted(
                             doc_cands,
