@@ -5680,7 +5680,6 @@ def manage_function_gauge_modal(
     Output("active-mpr-breakdown-modal-state", "data"),
     Input("card-mpr-total-kpis", "n_clicks"),
     Input("card-mpr-met-kpis", "n_clicks"),
-    Input("card-mpr-not-met-kpis", "n_clicks"),
     Input("card-mpr-improved-kpis", "n_clicks"),
     Input("card-mpr-neither-kpis", "n_clicks"),
     Input({"type": "mpr-modal-pill", "filter": ALL}, "n_clicks"),
@@ -5693,7 +5692,6 @@ def manage_function_gauge_modal(
 def manage_mpr_breakdown_modal(
     total_clicks,
     met_clicks,
-    not_met_clicks,
     improved_clicks,
     neither_clicks,
     pill_clicks,
@@ -5740,8 +5738,6 @@ def manage_mpr_breakdown_modal(
         target_filter = "neither"
     elif trig_id == "card-mpr-improved-kpis" and improved_clicks:
         target_filter = "improved"
-    elif trig_id == "card-mpr-not-met-kpis" and not_met_clicks:
-        target_filter = "not_met"
     elif trig_id == "card-mpr-met-kpis" and met_clicks:
         target_filter = "met"
     elif trig_id == "card-mpr-total-kpis" and total_clicks:

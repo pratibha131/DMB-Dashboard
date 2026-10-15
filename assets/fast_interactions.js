@@ -85,10 +85,12 @@
         // ----------------------------------------------------
         var rcaModal = document.getElementById('continuous-red-modal');
         var gaugeModal = document.getElementById('function-gauge-modal');
+        var mprModal = document.getElementById('mpr-breakdown-modal');
         var isRcaOpen = rcaModal && !rcaModal.classList.contains('continuous-red-modal-hidden');
         var isGaugeOpen = gaugeModal && !gaugeModal.classList.contains('function-gauge-modal-hidden');
+        var isMprOpen = mprModal && !mprModal.classList.contains('mpr-breakdown-modal-hidden');
 
-        if (isRcaOpen || isGaugeOpen) {
+        if (isRcaOpen || isGaugeOpen || isMprOpen) {
             document.body.classList.add('modal-open');
             document.documentElement.classList.add('modal-open');
         } else {
@@ -98,18 +100,20 @@
     }
 
     // ----------------------------------------------------
-    // 4. Global Event Delegation: Smooth Scroll on Clickable Summary Cards
+    // 4. Global Event Delegation: Smooth Scroll on Cards with data-scroll-target
     // ----------------------------------------------------
     document.addEventListener('click', function (e) {
-        var card = e.target && e.target.closest ? e.target.closest('.kpi-summary-card-clickable, [data-scroll-target]') : null;
+        var card = e.target && e.target.closest ? e.target.closest('[data-scroll-target]') : null;
         if (card) {
             if (e.target && (e.target.tagName === 'SELECT' || e.target.tagName === 'INPUT' || e.target.tagName === 'BUTTON')) {
                 return;
             }
-            var targetId = card.getAttribute('data-scroll-target') || 'rca-section';
-            var targetElem = document.getElementById(targetId);
-            if (targetElem) {
-                targetElem.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            var targetId = card.getAttribute('data-scroll-target');
+            if (targetId) {
+                var targetElem = document.getElementById(targetId);
+                if (targetElem) {
+                    targetElem.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                }
             }
         }
     });
@@ -131,6 +135,12 @@
                 if (gaugeModal && !gaugeModal.classList.contains('function-gauge-modal-hidden')) {
                     var gaugeClose = document.getElementById('close-function-gauge-modal');
                     if (gaugeClose) gaugeClose.click();
+                }
+
+                var mprModal = document.getElementById('mpr-breakdown-modal');
+                if (mprModal && !mprModal.classList.contains('mpr-breakdown-modal-hidden')) {
+                    var mprClose = document.getElementById('close-mpr-breakdown-modal');
+                    if (mprClose) mprClose.click();
                 }
             }
         });
