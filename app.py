@@ -16,7 +16,7 @@ from openpyxl.utils.exceptions import InvalidFileException
 import pandas as pd
 import plotly.graph_objects as go
 
-from data_loader import load_dashboard_data, load_strategic_rca_actions, clean_text
+from data_loader import load_dashboard_data, load_strategic_rca_actions, clean_text, is_value_lever
 from kpi_calculations import (
     get_default_reporting_month,
     get_month_summary,
@@ -105,7 +105,16 @@ _data_store.reload()
 
 
 def get_active_mpr_data():
-    return _data_store.get_mpr_data()
+    df = _data_store.get_mpr_data()
+    if not df.empty and "kpi_name" in df.columns:
+        df = df[~df["kpi_name"].map(is_value_lever)].copy()
+        if "strategic_imperative" in df.columns:
+            df.loc[
+                df["kpi_name"].str.strip().str.lower().str.startswith("win rate"),
+                "strategic_imperative",
+            ] = "Drive growth through Commercial Excellence"
+        return df
+    return df
 
 
 def get_active_dmb_data():
@@ -113,12 +122,23 @@ def get_active_dmb_data():
 
 
 def get_active_strat_rca():
-    return _data_store.get_strat_rca()
+    df = _data_store.get_strat_rca()
+    if not df.empty and "kpi_name" in df.columns:
+        df = df[~df["kpi_name"].map(is_value_lever)].copy()
+        if "strategic_imperative" in df.columns:
+            df.loc[
+                df["kpi_name"].str.strip().str.lower().str.startswith("win rate"),
+                "strategic_imperative",
+            ] = "Drive growth through Commercial Excellence"
+        return df
+    return df
 
 
 def load_rca_actions():
     strat_actions = load_strategic_rca_actions()
     if not strat_actions.empty:
+        if "kpi_name" in strat_actions.columns:
+            strat_actions = strat_actions[~strat_actions["kpi_name"].map(is_value_lever)].copy()
         return strat_actions
 
     required_columns = [
@@ -2582,6 +2602,9 @@ def create_rca_table(selected_month):
             className="rca-empty-message",
         )
 
+    if "kpi_name" in monthly_actions.columns:
+        monthly_actions = monthly_actions[~monthly_actions["kpi_name"].map(is_value_lever)].copy()
+
     for column in [
         "strategic_imperative",
         "kpi_name",
@@ -3528,12 +3551,7 @@ def create_continuous_red_detail(function_name, selected_month):
 # =========================================================
 
 def create_imperative_chart(current_data):
-    valid = current_data[
-        current_data["Actual"].notna()
-        & current_data["Target"].notna()
-    ].copy()
-
-    if valid.empty:
+    if current_data.empty:
         empty_figure = go.Figure()
         empty_figure.add_annotation(
             text="No strategic-imperative data available.",
@@ -3554,19 +3572,51 @@ def create_imperative_chart(current_data):
         )
         return empty_figure
 
-    summary = (
-        valid.groupby(
+    data = current_data.copy()
+    if "kpi_name" in data.columns and "strategic_imperative" in data.columns:
+        data.loc[
+            data["kpi_name"].str.strip().str.lower().str.startswith("win rate"),
+            "strategic_imperative",
+        ] = "Drive growth through Commercial Excellence"
+
+    total_df = (
+        data.groupby(
             "strategic_imperative",
             sort=False,
             as_index=False,
         )
-        .agg(
-            total=("kpi_name", "count"),
-            met=("is_met", "sum"),
-        )
+        .agg(total=("kpi_name", "count"))
     )
 
-    summary["percentage"] = summary["met"] / summary["total"] * 100
+    met_df = (
+        data[data["is_met"].eq(True)]
+        .groupby(
+            "strategic_imperative",
+            sort=False,
+            as_index=False,
+        )
+        .agg(met=("kpi_name", "count"))
+    )
+
+    summary = total_df.merge(met_df, on="strategic_imperative", how="left")
+    summary["met"] = summary["met"].fillna(0).astype(int)
+    summary["percentage"] = summary.apply(
+        lambda r: (r["met"] / r["total"] * 100) if r["total"] > 0 else 0.0,
+        axis=1,
+    )
+
+    display_order = [
+        "Customer Focus",
+        "Drive growth through Commercial Excellence",
+        "Environmental, Social & Governance",
+        "Improve Deliverability & Profitability",
+        "Patient Safety & Quality",
+        "Roadmap competitiveness & Innovation agility",
+    ]
+    summary["sort_order"] = summary["strategic_imperative"].map(
+        lambda x: display_order.index(x) if x in display_order else 99
+    )
+    summary = summary.sort_values("sort_order").reset_index(drop=True)
 
     compact_labels = {
         "Customer Focus": "Customer<br>Focus",
@@ -3580,6 +3630,8 @@ def create_imperative_chart(current_data):
         "Roadmap competitiveness & Innovation agility": (
             "Roadmap &<br>Innovation"
         ),
+        "Environmental, Social & Governance": "Environmental,<br>Social & Governance",
+        "Environmental, Social & Governance (ESG)": "Environmental,<br>Social & Governance",
     }
 
     summary["chart_label"] = summary["strategic_imperative"].map(
@@ -3664,36 +3716,51 @@ def create_imperative_chart(current_data):
 
 def create_trend_chart(selected_month):
     active_mpr = get_active_mpr_data()
-    trend = active_mpr[active_mpr["month"] <= selected_month].copy()
+    selected_month = pd.Timestamp(selected_month)
+    month_data = active_mpr[active_mpr["month"] <= selected_month].copy()
 
-    trend = trend[
-        trend["Actual"].notna()
-        & trend["Target"].notna()
-    ]
-
-    if trend.empty:
+    if month_data.empty:
         return go.Figure()
 
+    months_with_data = (
+        month_data[month_data["Actual"].notna()]["month"].unique()
+    )
+    if len(months_with_data) == 0:
+        return go.Figure()
+
+    month_data = month_data[month_data["month"].isin(months_with_data)].copy()
+
+    # Re-calculate using user's formula:
+    # KPIs met -> total kpi met / total critical * 100
+    # KPIs improved -> total kpis improved / total critical * 100
     trend = (
-        trend.groupby("month", as_index=False)
+        month_data.groupby("month", as_index=False)
         .agg(
-            total=("kpi_name", "count"),
+            total_critical=("kpi_name", "count"),
             met=("is_met", "sum"),
             improved=("is_improved", "sum"),
         )
     )
 
-    trend["met_percentage"] = trend["met"] / trend["total"] * 100
-    trend["improved_percentage"] = (
-        trend["improved"] / trend["total"] * 100
+    trend["met_percentage"] = trend.apply(
+        lambda r: (r["met"] / r["total_critical"] * 100) if r["total_critical"] > 0 else 0.0,
+        axis=1,
+    )
+    trend["improved_percentage"] = trend.apply(
+        lambda r: (r["improved"] / r["total_critical"] * 100) if r["total_critical"] > 0 else 0.0,
+        axis=1,
     )
 
     figure = go.Figure()
+
+    custom_met = trend[["met", "total_critical"]].to_numpy()
+    custom_imp = trend[["improved", "total_critical"]].to_numpy()
 
     figure.add_trace(
         go.Scatter(
             x=trend["month"],
             y=trend["met_percentage"],
+            customdata=custom_met,
             mode="lines+markers",
             name="KPIs met",
             line={"color": "#168b69", "width": 3},
@@ -3703,7 +3770,7 @@ def create_trend_chart(selected_month):
                 "line": {"color": "#168b69", "width": 2},
             },
             hovertemplate=(
-                "%{x|%B %Y}<br>KPIs met: %{y:.1f}%<extra></extra>"
+                "%{x|%B %Y}<br>KPIs met: %{customdata[0]} of %{customdata[1]} (%{y:.1f}%)<extra></extra>"
             ),
         )
     )
@@ -3712,6 +3779,7 @@ def create_trend_chart(selected_month):
         go.Scatter(
             x=trend["month"],
             y=trend["improved_percentage"],
+            customdata=custom_imp,
             mode="lines+markers",
             name="KPIs improved",
             line={"color": "#c18100", "width": 3},
@@ -3721,7 +3789,7 @@ def create_trend_chart(selected_month):
                 "line": {"color": "#c18100", "width": 2},
             },
             hovertemplate=(
-                "%{x|%B %Y}<br>KPIs improved: %{y:.1f}%<extra></extra>"
+                "%{x|%B %Y}<br>KPIs improved: %{customdata[0]} of %{customdata[1]} (%{y:.1f}%)<extra></extra>"
             ),
         )
     )

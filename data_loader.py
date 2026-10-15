@@ -74,6 +74,29 @@ def clean_text(value):
     return str(value).replace("\xa0", " ").strip()
 
 
+VALUE_LEVER_PATTERNS = [
+    r"cost\s+of\s+non[-\s]?quality",
+    r"competitive\s+roadmap",
+    r"vitality\s+index",
+    r"i2m\s+value\s+creation",
+    r"time\s+to\s+system\s+up",
+    r"\bttsu\b",
+    r"margin\s+expansion",
+]
+
+
+def is_value_lever(name):
+    """Return True if KPI name matches any of the MoS Value Levers (2026-2028)."""
+    if not name or pd.isna(name):
+        return False
+    s = str(name).strip().lower()
+    for pat in VALUE_LEVER_PATTERNS:
+        if re.search(pat, s):
+            return True
+    return False
+
+
+
 CRISP_RCA_MAP = {
     # Customer Focus - Contract Penetration
     ("Contract Penetration", "cause"): (
@@ -292,8 +315,16 @@ def load_mpr_data_from_strategic(excel_path=None):
     current_strat = ""
     current_kpi_name = ""
     records = []
+    in_value_levers = False
 
     for r in range(header_row_idx + 1, len(raw)):
+        row_text = " ".join([str(val) for val in raw.iloc[r] if pd.notna(val)]).lower()
+        if "value lever" in row_text:
+            in_value_levers = True
+            continue
+        if in_value_levers:
+            continue
+
         strat_val = raw.iloc[r, 0] if raw.shape[1] > 0 else None
         if pd.notna(strat_val) and str(strat_val).strip() and not str(strat_val).startswith("MoS") and not str(strat_val).startswith("Strategic"):
             raw_s = str(strat_val).strip()
@@ -321,7 +352,7 @@ def load_mpr_data_from_strategic(excel_path=None):
                 kpi_name = current_kpi_name
             elif not kpi_name and kpi_def:
                 kpi_name = kpi_def
-            if not kpi_name or kpi_name.lower().startswith("value lever") or kpi_name.lower().startswith("kpi "):
+            if not kpi_name or is_value_lever(kpi_name) or kpi_name.lower().startswith("value lever") or kpi_name.lower().startswith("kpi "):
                 continue
             current_kpi_name = kpi_name
 
@@ -455,6 +486,10 @@ def load_mpr_data(excel_path=None):
         if row_type not in {"T", "A", "TARGET", "ACTUAL"}:
             continue
 
+        raw_kpi = clean_text(raw.iat[row_number, 0])
+        if not raw_kpi or is_value_lever(raw_kpi) or raw_kpi.lower().startswith("value lever"):
+            continue
+
         series_name = (
             "Target"
             if row_type in {"T", "TARGET"}
@@ -472,9 +507,14 @@ def load_mpr_data(excel_path=None):
 
             value = raw.iat[row_number, column]
 
+            imp = (
+                "Drive growth through Commercial Excellence"
+                if "win rate" in first_cell.lower()
+                else current_imperative
+            )
             records.append(
                 {
-                    "strategic_imperative": current_imperative,
+                    "strategic_imperative": imp,
                     "kpi_name": first_cell,
                     "month": month_date,
                     "metric_owner": clean_text(raw.iat[row_number, 1]),
@@ -804,19 +844,36 @@ def load_strategic_rca_actions(excel_path=None):
     # an (EQ)/(CS) suffix, so every other KPI keeps its name from the sheet.
     kpi_name_counts = {}
     carried_kpi_name = ""
+    in_value_levers_count = False
     for r in range(header_row_idx + 1, len(df)):
+        row_text = " ".join([str(val) for val in df.iloc[r] if pd.notna(val)]).lower()
+        if "value lever" in row_text:
+            in_value_levers_count = True
+            continue
+        if in_value_levers_count:
+            continue
         if not is_target_row(r):
             continue
         kpi_val = df.iloc[r, 1] if df.shape[1] > 1 else ""
         if pd.notna(kpi_val) and str(kpi_val).strip():
             carried_kpi_name = clean_text(kpi_val)
+        if not carried_kpi_name or is_value_lever(carried_kpi_name) or carried_kpi_name.lower().startswith("value lever"):
+            continue
         kpi_name_counts[carried_kpi_name] = kpi_name_counts.get(carried_kpi_name, 0) + 1
 
     current_strat = ""
     current_kpi_name = ""
     records = []
+    in_value_levers = False
 
     for r in range(header_row_idx + 1, len(df)):
+        row_text = " ".join([str(val) for val in df.iloc[r] if pd.notna(val)]).lower()
+        if "value lever" in row_text:
+            in_value_levers = True
+            continue
+        if in_value_levers:
+            continue
+
         strat_val = df.iloc[r, 0] if df.shape[1] > 0 else None
         if pd.notna(strat_val) and str(strat_val).strip() and not str(strat_val).startswith("MoS") and not str(strat_val).startswith("Strategic"):
             raw_s = str(strat_val).strip()
@@ -843,7 +900,7 @@ def load_strategic_rca_actions(excel_path=None):
             kpi_def = clean_text(df.iloc[r, 3] if df.shape[1] > 3 else "")
 
             kpi_name = current_kpi_name
-            if not kpi_name or kpi_name.lower().startswith("value lever") or kpi_name.lower().startswith("kpi "):
+            if not kpi_name or is_value_lever(kpi_name) or kpi_name.lower().startswith("value lever") or kpi_name.lower().startswith("kpi "):
                 continue
 
             if kpi_name_counts.get(current_kpi_name, 0) > 1:
@@ -1091,9 +1148,23 @@ class DMBDataStore:
                     self._mpr_raw = mpr_raw
                     self._dmb_raw = dmb_raw
                     self._mpr_data = prepare_kpi_data(mpr_raw, ["strategic_imperative", "kpi_name"])
+                    if not self._mpr_data.empty and "kpi_name" in self._mpr_data.columns:
+                        self._mpr_data = self._mpr_data[~self._mpr_data["kpi_name"].map(is_value_lever)].reset_index(drop=True)
+                        if "strategic_imperative" in self._mpr_data.columns:
+                            self._mpr_data.loc[
+                                self._mpr_data["kpi_name"].str.strip().str.lower().str.startswith("win rate"),
+                                "strategic_imperative",
+                            ] = "Drive growth through Commercial Excellence"
                     self._dmb_data = prepare_kpi_data(dmb_raw, ["function", "kpi_name"])
 
                 self._strat_rca = load_strategic_rca_actions()
+                if not self._strat_rca.empty and "kpi_name" in self._strat_rca.columns:
+                    self._strat_rca = self._strat_rca[~self._strat_rca["kpi_name"].map(is_value_lever)].reset_index(drop=True)
+                    if "strategic_imperative" in self._strat_rca.columns:
+                        self._strat_rca.loc[
+                            self._strat_rca["kpi_name"].str.strip().str.lower().str.startswith("win rate"),
+                            "strategic_imperative",
+                        ] = "Drive growth through Commercial Excellence"
                 self._signature = data_folder_signature()
                 self._last_loaded = time.time()
                 return True

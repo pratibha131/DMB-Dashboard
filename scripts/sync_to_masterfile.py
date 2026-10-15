@@ -51,6 +51,28 @@ TARGET_MASTERFILE = DATA_DIR / "Masterfile_DMB_Dashboard.xlsx"
 
 MONTH_NAMES = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
 
+VALUE_LEVER_PATTERNS = [
+    r"cost\s+of\s+non[-\s]?quality",
+    r"competitive\s+roadmap",
+    r"vitality\s+index",
+    r"i2m\s+value\s+creation",
+    r"time\s+to\s+system\s+up",
+    r"\bttsu\b",
+    r"margin\s+expansion",
+]
+
+
+def is_value_lever(name: Any) -> bool:
+    """Check if KPI name matches any of the MoS Value Levers (2026-2028)."""
+    if not name or (isinstance(name, float) and pd.isna(name)):
+        return False
+    s = str(name).strip().lower()
+    for pat in VALUE_LEVER_PATTERNS:
+        if re.search(pat, s):
+            return True
+    return False
+
+
 SHEET_MAP = [
     ("1.Quality", "Quality DMB"),
     ("2.Regulatory", "Regulatory"),
@@ -347,8 +369,8 @@ def validate_masterfile_content(content: bytes) -> Tuple[bool, str, int, int]:
 
         if dmb_rows < 180:
             return False, f"DMB Masterfile row count too low ({dmb_rows} < 180). Possible truncation.", dmb_rows, mpr_rows
-        if mpr_rows < 45:
-            return False, f"MPR Masterfile row count too low ({mpr_rows} < 45). Possible truncation.", dmb_rows, mpr_rows
+        if mpr_rows < 35:
+            return False, f"MPR Masterfile row count too low ({mpr_rows} < 35). Possible truncation.", dmb_rows, mpr_rows
 
         return True, "Valid complete Masterfile.", dmb_rows, mpr_rows
     except Exception as e:
@@ -405,16 +427,31 @@ def sync_masterfile(
     elif "AOP Critical" in wb_strat.sheetnames:
         mpr_src_sheet = wb_strat["AOP Critical"]
 
+    # Clear any existing MPR Masterfile sheet to avoid stale/orphaned rows
     if "MPR Masterfile" in out_wb.sheetnames:
-        mpr_dst_sheet = out_wb["MPR Masterfile"]
-    else:
-        mpr_dst_sheet = out_wb.create_sheet(title="MPR Masterfile", index=0)
+        del out_wb["MPR Masterfile"]
+    mpr_dst_sheet = out_wb.create_sheet(title="MPR Masterfile", index=0)
 
     if mpr_src_sheet:
+        dst_r_idx = 1
+        in_value_levers_sec = False
         for r_idx in range(1, mpr_src_sheet.max_row + 1):
+            val_c1 = mpr_src_sheet.cell(r_idx, 1).value
+            val_c2 = mpr_src_sheet.cell(r_idx, 2).value
+            row_str = " ".join([str(mpr_src_sheet.cell(r_idx, c).value or "") for c in range(1, min(6, mpr_src_sheet.max_column + 1))]).lower()
+
+            if "value lever" in row_str:
+                in_value_levers_sec = True
+                continue
+            if in_value_levers_sec:
+                continue
+
+            if is_value_lever(val_c1) or is_value_lever(val_c2):
+                continue
+
             for c_idx in range(1, mpr_src_sheet.max_column + 1):
                 src_cell = mpr_src_sheet.cell(r_idx, c_idx)
-                dst_cell = mpr_dst_sheet.cell(r_idx, c_idx)
+                dst_cell = mpr_dst_sheet.cell(dst_r_idx, c_idx)
                 dst_cell.value = src_cell.value
                 if src_cell.has_style:
                     try:
@@ -430,6 +467,7 @@ def sync_masterfile(
                             dst_cell.number_format = src_cell.number_format
                     except Exception:
                         pass
+            dst_r_idx += 1
 
     # --- 2. Sync DMB Masterfile ---
     all_extracted_kpis = extract_functional_kpis(wb_func)
