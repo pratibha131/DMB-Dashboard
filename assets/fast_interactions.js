@@ -73,7 +73,6 @@
                 card.addEventListener('dblclick', function (e) {
                     e.preventDefault();
                     triggerRcaFeedback();
-                    card.click();
                 });
             }
         });
@@ -97,7 +96,6 @@
                 card.addEventListener('dblclick', function (e) {
                     e.preventDefault();
                     triggerGaugeFeedback();
-                    card.click();
                 });
             }
         });

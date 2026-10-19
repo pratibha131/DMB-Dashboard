@@ -4788,9 +4788,9 @@ def serve_layout():
                 className="top-navigation",
             ),
             dcc.Store(id="one-pager-download-state"),
-            dcc.Store(id="active-rca-modal-state", storage_type="session", data={"is_open": False, "function": None, "month": None}),
-            dcc.Store(id="active-gauge-modal-state", storage_type="session", data={"is_open": False, "function": None, "selected_kpi": None, "month": None}),
-            dcc.Store(id="active-mpr-breakdown-modal-state", storage_type="session", data={"is_open": False, "filter": "outside", "month": None}),
+            dcc.Store(id="active-rca-modal-state", storage_type="memory", data={"is_open": False, "function": None, "month": None}),
+            dcc.Store(id="active-gauge-modal-state", storage_type="memory", data={"is_open": False, "function": None, "selected_kpi": None, "month": None}),
+            dcc.Store(id="active-mpr-breakdown-modal-state", storage_type="memory", data={"is_open": False, "filter": "outside", "month": None}),
             dcc.Interval(id="live-sync-interval", interval=10000, n_intervals=0),
             dcc.Store(id="live-sync-state-store"),
             html.Section(
@@ -5509,37 +5509,15 @@ def manage_continuous_red_modal(
             )
         raise PreventUpdate
 
-    # 2. RCA Card Clicked from Dashboard (Single click, double click, or rapid clicks)
+    # 2. RCA Card Clicked from Dashboard (Must be an actual user click with n_clicks > 0)
     clicked_fn = None
+    has_card_clicks = any(c for c in (card_clicks or []) if c and c > 0)
 
-    parsed_trig = trig_id
-    if isinstance(trig_id, str) and trig_id.startswith("{"):
-        try:
-            parsed_trig = json.loads(trig_id)
-        except Exception:
-            parsed_trig = None
-
-    if isinstance(parsed_trig, dict) and parsed_trig.get("type") == "continuous-red-card":
-        clicked_fn = parsed_trig.get("function")
-
-    if not clicked_fn:
-        triggered_props = getattr(dash.ctx, "triggered_prop_ids", {}) or {}
-        for prop, comp_id in triggered_props.items():
-            parsed_comp = comp_id
-            if isinstance(comp_id, str) and comp_id.startswith("{"):
-                try:
-                    parsed_comp = json.loads(comp_id)
-                except Exception:
-                    parsed_comp = None
-            if isinstance(parsed_comp, dict) and parsed_comp.get("type") == "continuous-red-card":
-                clicked_fn = parsed_comp.get("function")
-                break
-
-    if not clicked_fn:
+    if has_card_clicks:
         for item in (ctx_inst.triggered or []):
             prop_id = item.get("prop_id", "")
             val = item.get("value")
-            if "continuous-red-card" in prop_id and (val is None or val > 0):
+            if "continuous-red-card" in prop_id and val is not None and val > 0:
                 comp_id_str = prop_id.rsplit(".", 1)[0]
                 try:
                     parsed = json.loads(comp_id_str) if comp_id_str.startswith("{") else None
@@ -5548,6 +5526,16 @@ def manage_continuous_red_modal(
                         break
                 except Exception:
                     pass
+
+        if not clicked_fn:
+            parsed_trig = trig_id
+            if isinstance(trig_id, str) and trig_id.startswith("{"):
+                try:
+                    parsed_trig = json.loads(trig_id)
+                except Exception:
+                    parsed_trig = None
+            if isinstance(parsed_trig, dict) and parsed_trig.get("type") == "continuous-red-card":
+                clicked_fn = parsed_trig.get("function")
 
     if clicked_fn:
         _, c_title, c_month, c_body = get_continuous_red_modal_content(
@@ -5565,25 +5553,26 @@ def manage_continuous_red_modal(
             },
         )
 
-    # 3. Live Sync / Month Change (If modal is currently open, keep it open and update content)
+    # 3. Live Sync / Month Change (Update content ONLY if modal is currently open and trigger was filter/sync)
     if current_modal_state.get("is_open") and current_modal_state.get("function"):
-        current_fn = current_modal_state["function"]
-        _, c_title, c_month, c_body = get_continuous_red_modal_content(
-            current_fn, selected_month
-        )
-        return (
-            "continuous-red-modal",
-            c_title,
-            c_month,
-            c_body,
-            {
-                "is_open": True,
-                "function": current_fn,
-                "month": selected_month,
-            },
-        )
+        if trig_id in ("dmb-month-filter", "live-sync-state-store"):
+            current_fn = current_modal_state["function"]
+            _, c_title, c_month, c_body = get_continuous_red_modal_content(
+                current_fn, selected_month
+            )
+            return (
+                "continuous-red-modal",
+                c_title,
+                c_month,
+                c_body,
+                {
+                    "is_open": True,
+                    "function": current_fn,
+                    "month": selected_month,
+                },
+            )
 
-    # 4. Modal is closed and background sync triggered -> Do nothing
+    # 4. Modal is closed or no valid action -> Do nothing
     raise PreventUpdate
 
 
@@ -5651,37 +5640,15 @@ def manage_function_gauge_modal(
             )
         raise PreventUpdate
 
-    # 2. Gauge Card Clicked from Dashboard (Single click, double click, or rapid clicks)
+    # 2. Gauge Card Clicked from Dashboard (Must be an actual user click with n_clicks > 0)
     clicked_gauge_fn = None
+    has_gauge_clicks = any(c for c in (gauge_card_clicks or []) if c and c > 0)
 
-    parsed_trig = trig_id
-    if isinstance(trig_id, str) and trig_id.startswith("{"):
-        try:
-            parsed_trig = json.loads(trig_id)
-        except Exception:
-            parsed_trig = None
-
-    if isinstance(parsed_trig, dict) and parsed_trig.get("type") == "function-gauge-card":
-        clicked_gauge_fn = parsed_trig.get("function")
-
-    if not clicked_gauge_fn:
-        triggered_props = getattr(dash.ctx, "triggered_prop_ids", {}) or {}
-        for prop, comp_id in triggered_props.items():
-            parsed_comp = comp_id
-            if isinstance(comp_id, str) and comp_id.startswith("{"):
-                try:
-                    parsed_comp = json.loads(comp_id)
-                except Exception:
-                    parsed_comp = None
-            if isinstance(parsed_comp, dict) and parsed_comp.get("type") == "function-gauge-card":
-                clicked_gauge_fn = parsed_comp.get("function")
-                break
-
-    if not clicked_gauge_fn:
+    if has_gauge_clicks:
         for item in (ctx_inst.triggered or []):
             prop_id = item.get("prop_id", "")
             val = item.get("value")
-            if "function-gauge-card" in prop_id and (val is None or val > 0):
+            if "function-gauge-card" in prop_id and val is not None and val > 0:
                 comp_id_str = prop_id.rsplit(".", 1)[0]
                 try:
                     parsed = json.loads(comp_id_str) if comp_id_str.startswith("{") else None
@@ -5690,6 +5657,16 @@ def manage_function_gauge_modal(
                         break
                 except Exception:
                     pass
+
+        if not clicked_gauge_fn:
+            parsed_trig = trig_id
+            if isinstance(trig_id, str) and trig_id.startswith("{"):
+                try:
+                    parsed_trig = json.loads(trig_id)
+                except Exception:
+                    parsed_trig = None
+            if isinstance(parsed_trig, dict) and parsed_trig.get("type") == "function-gauge-card":
+                clicked_gauge_fn = parsed_trig.get("function")
 
     if clicked_gauge_fn:
         detail_content = get_function_kpis_trend_modal_content(
@@ -5708,26 +5685,27 @@ def manage_function_gauge_modal(
             },
         )
 
-    # 3. Live Sync or Month Filter Change (Update content if modal currently open)
+    # 3. Live Sync or Month Filter Change (Update content ONLY if modal currently open and trigger was filter/sync)
     if current_modal_state.get("is_open") and current_modal_state.get("function"):
-        func_name = current_modal_state["function"]
-        detail_content = get_function_kpis_trend_modal_content(
-            func_name, selected_month
-        )
-        sel_dt = pd.Timestamp(selected_month)
-        return (
-            "function-gauge-modal",
-            f"{func_name} — Function KPI Performance Review",
-            f"All Key Performance Indicators · {sel_dt.strftime('%B %Y')}",
-            detail_content,
-            {
-                "is_open": True,
-                "function": func_name,
-                "month": selected_month,
-            },
-        )
+        if trig_id in ("dmb-month-filter", "live-sync-state-store"):
+            func_name = current_modal_state["function"]
+            detail_content = get_function_kpis_trend_modal_content(
+                func_name, selected_month
+            )
+            sel_dt = pd.Timestamp(selected_month)
+            return (
+                "function-gauge-modal",
+                f"{func_name} — Function KPI Performance Review",
+                f"All Key Performance Indicators · {sel_dt.strftime('%B %Y')}",
+                detail_content,
+                {
+                    "is_open": True,
+                    "function": func_name,
+                    "month": selected_month,
+                },
+            )
 
-    # 4. Modal is closed and background sync triggered -> Do nothing
+    # 4. Modal is closed or no valid action -> Do nothing
     raise PreventUpdate
 
 # =========================================================
