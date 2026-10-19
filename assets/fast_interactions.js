@@ -58,11 +58,22 @@
         rcaCards.forEach(function (card) {
             if (!card.hasAttribute('data-click-bound')) {
                 card.setAttribute('data-click-bound', 'true');
-                card.addEventListener('click', function () {
+
+                function triggerRcaFeedback() {
                     card.classList.add('card-clicking');
                     setTimeout(function () {
                         card.classList.remove('card-clicking');
-                    }, 400);
+                    }, 250);
+                }
+
+                card.addEventListener('click', function () {
+                    triggerRcaFeedback();
+                });
+
+                card.addEventListener('dblclick', function (e) {
+                    e.preventDefault();
+                    triggerRcaFeedback();
+                    card.click();
                 });
             }
         });
@@ -71,11 +82,22 @@
         gaugeCards.forEach(function (card) {
             if (!card.hasAttribute('data-click-bound')) {
                 card.setAttribute('data-click-bound', 'true');
-                card.addEventListener('click', function () {
+
+                function triggerGaugeFeedback() {
                     card.classList.add('card-clicking');
                     setTimeout(function () {
                         card.classList.remove('card-clicking');
-                    }, 400);
+                    }, 250);
+                }
+
+                card.addEventListener('click', function () {
+                    triggerGaugeFeedback();
+                });
+
+                card.addEventListener('dblclick', function (e) {
+                    e.preventDefault();
+                    triggerGaugeFeedback();
+                    card.click();
                 });
             }
         });

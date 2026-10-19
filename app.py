@@ -5509,15 +5509,45 @@ def manage_continuous_red_modal(
             )
         raise PreventUpdate
 
-    # 2. RCA Card Clicked from Dashboard (Must have positive clicks)
+    # 2. RCA Card Clicked from Dashboard (Single click, double click, or rapid clicks)
     clicked_fn = None
-    if isinstance(trig_id, dict) and trig_id.get("type") == "continuous-red-card":
-        for item in ctx_inst.triggered:
-            val = item.get("value")
-            prop_id = item.get("prop_id", "")
-            if "continuous-red-card" in prop_id and val is not None and val > 0:
-                clicked_fn = trig_id.get("function")
+
+    parsed_trig = trig_id
+    if isinstance(trig_id, str) and trig_id.startswith("{"):
+        try:
+            parsed_trig = json.loads(trig_id)
+        except Exception:
+            parsed_trig = None
+
+    if isinstance(parsed_trig, dict) and parsed_trig.get("type") == "continuous-red-card":
+        clicked_fn = parsed_trig.get("function")
+
+    if not clicked_fn:
+        triggered_props = getattr(dash.ctx, "triggered_prop_ids", {}) or {}
+        for prop, comp_id in triggered_props.items():
+            parsed_comp = comp_id
+            if isinstance(comp_id, str) and comp_id.startswith("{"):
+                try:
+                    parsed_comp = json.loads(comp_id)
+                except Exception:
+                    parsed_comp = None
+            if isinstance(parsed_comp, dict) and parsed_comp.get("type") == "continuous-red-card":
+                clicked_fn = parsed_comp.get("function")
                 break
+
+    if not clicked_fn:
+        for item in (ctx_inst.triggered or []):
+            prop_id = item.get("prop_id", "")
+            val = item.get("value")
+            if "continuous-red-card" in prop_id and (val is None or val > 0):
+                comp_id_str = prop_id.rsplit(".", 1)[0]
+                try:
+                    parsed = json.loads(comp_id_str) if comp_id_str.startswith("{") else None
+                    if isinstance(parsed, dict) and parsed.get("type") == "continuous-red-card":
+                        clicked_fn = parsed.get("function")
+                        break
+                except Exception:
+                    pass
 
     if clicked_fn:
         _, c_title, c_month, c_body = get_continuous_red_modal_content(
@@ -5621,15 +5651,45 @@ def manage_function_gauge_modal(
             )
         raise PreventUpdate
 
-    # 2. Gauge Card Clicked from Dashboard (Must have positive clicks)
+    # 2. Gauge Card Clicked from Dashboard (Single click, double click, or rapid clicks)
     clicked_gauge_fn = None
-    if isinstance(trig_id, dict) and trig_id.get("type") == "function-gauge-card":
-        for item in ctx_inst.triggered:
-            val = item.get("value")
-            prop_id = item.get("prop_id", "")
-            if "function-gauge-card" in prop_id and val is not None and val > 0:
-                clicked_gauge_fn = trig_id.get("function")
+
+    parsed_trig = trig_id
+    if isinstance(trig_id, str) and trig_id.startswith("{"):
+        try:
+            parsed_trig = json.loads(trig_id)
+        except Exception:
+            parsed_trig = None
+
+    if isinstance(parsed_trig, dict) and parsed_trig.get("type") == "function-gauge-card":
+        clicked_gauge_fn = parsed_trig.get("function")
+
+    if not clicked_gauge_fn:
+        triggered_props = getattr(dash.ctx, "triggered_prop_ids", {}) or {}
+        for prop, comp_id in triggered_props.items():
+            parsed_comp = comp_id
+            if isinstance(comp_id, str) and comp_id.startswith("{"):
+                try:
+                    parsed_comp = json.loads(comp_id)
+                except Exception:
+                    parsed_comp = None
+            if isinstance(parsed_comp, dict) and parsed_comp.get("type") == "function-gauge-card":
+                clicked_gauge_fn = parsed_comp.get("function")
                 break
+
+    if not clicked_gauge_fn:
+        for item in (ctx_inst.triggered or []):
+            prop_id = item.get("prop_id", "")
+            val = item.get("value")
+            if "function-gauge-card" in prop_id and (val is None or val > 0):
+                comp_id_str = prop_id.rsplit(".", 1)[0]
+                try:
+                    parsed = json.loads(comp_id_str) if comp_id_str.startswith("{") else None
+                    if isinstance(parsed, dict) and parsed.get("type") == "function-gauge-card":
+                        clicked_gauge_fn = parsed.get("function")
+                        break
+                except Exception:
+                    pass
 
     if clicked_gauge_fn:
         detail_content = get_function_kpis_trend_modal_content(
@@ -5666,6 +5726,9 @@ def manage_function_gauge_modal(
                 "month": selected_month,
             },
         )
+
+    # 4. Modal is closed and background sync triggered -> Do nothing
+    raise PreventUpdate
 
 # =========================================================
 # MPR BREAKDOWN MODAL CALLBACK

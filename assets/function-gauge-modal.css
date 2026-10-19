@@ -19,9 +19,10 @@
 
 .mini-gauge-container-clickable:active,
 .mini-gauge-container-clickable.card-clicking {
-    transform: translateY(0) scale(0.97) !important;
+    background: #ddebf5 !important;
+    border-color: #075a86 !important;
     box-shadow: 0 0 0 3px rgba(7, 90, 134, 0.3), 0 2px 8px rgba(7, 90, 134, 0.2) !important;
-    transition: transform 0.14s cubic-bezier(0.2, 0, 0, 1), box-shadow 0.14s ease !important;
+    transition: background 0.1s ease, box-shadow 0.1s ease !important;
 }
 
 .function-gauge-modal {
