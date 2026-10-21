@@ -18,6 +18,7 @@ from __future__ import annotations
 import base64
 import email
 import email.utils
+import hashlib
 import imaplib
 import io
 import json
@@ -208,6 +209,12 @@ def push_to_github_if_configured(filename: str, content: bytes) -> bool:
                 logger.warning("GitHub API check returned HTTP %d for %s: %s", e.code, path, e)
         except Exception as e:
             logger.debug("GitHub SHA check notice: %s", e)
+
+        # Check if identical content is already on GitHub to prevent redundant commits
+        blob_sha = hashlib.sha1(f"blob {len(content)}\0".encode() + content).hexdigest()
+        if sha and sha == blob_sha:
+            logger.debug("File data/%s is already identical on GitHub (SHA %s); skipping redundant commit.", filename, sha[:7])
+            return True
 
         payload = {
             "message": f"Auto-sync {filename} from SharePoint via live sync",

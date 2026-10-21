@@ -506,8 +506,6 @@ class SharePointSyncManager:
         sources_need_consolidation = (
             func_file_name in updated_files
             or strat_file_name in updated_files
-            or (strat_p.exists() and strat_p.stat().st_mtime > m_mtime)
-            or (func_p.exists() and func_p.stat().st_mtime > m_mtime)
             or not master_p.exists()
         )
 
