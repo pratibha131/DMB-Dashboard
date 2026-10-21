@@ -210,7 +210,7 @@ def push_to_github_if_configured(filename: str, content: bytes) -> bool:
             logger.debug("GitHub SHA check notice: %s", e)
 
         payload = {
-            "message": f"Auto-sync {filename} from SharePoint via live sync [skip ci]",
+            "message": f"Auto-sync {filename} from SharePoint via live sync",
             "content": base64.b64encode(content).decode("ascii"),
             "branch": "main",
         }
@@ -325,7 +325,7 @@ def sync_once(resolve_target: Callable[[str], Path] | None = None) -> Tuple[int,
 
     try:
         port = cfg["port"]
-        with imaplib.IMAP4_SSL(host, port, timeout=3) as imap:
+        with imaplib.IMAP4_SSL(host, port, timeout=15) as imap:
             clean_password = password.replace(" ", "") if "gmail.com" in host.lower() else password
             imap.login(user, clean_password)
             imap.select(cfg["folder"])
@@ -448,7 +448,7 @@ def sync_once(resolve_target: Callable[[str], Path] | None = None) -> Tuple[int,
                     break
 
     except Exception as exc:
-        logger.debug("Mailbox sync notice: %s", exc)
+        logger.warning("Mailbox sync notice: %s", exc)
         return len(updated_files), updated_files
 
     return len(updated_files), updated_files
