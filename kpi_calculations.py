@@ -72,12 +72,12 @@ def clean_numeric_column(df, col):
         if isinstance(val, (int, float)):
             cleaned.append(float(val))
             continue
-        s = str(val).replace("\xa0", " ").strip()
+        s = str(val).replace("\xa0", " ").strip().strip("`'\"")
         if not s or s.lower() in {"none", "nan", "null", "-", "qtr", "hy", "tbd", "n/a", "na"}:
             cleaned.append(float("nan"))
             continue
         has_pct = "%" in s
-        s_clean = s.replace("%", "").replace(",", "").strip()
+        s_clean = s.replace("%", "").replace(",", "").strip().strip("`'\"")
         try:
             num = float(s_clean)
             kpi_name = df.loc[idx, "kpi_name"] if "kpi_name" in df.columns and idx in df.index else ""

@@ -117,17 +117,17 @@ def normalize_numeric_value(val: Any, target_aop: Any = None, units: str = "") -
         return None
     if isinstance(val, (int, float)):
         return val
-    s = clean_text(val)
+    s = clean_text(val).strip("`'\"")
     if not s or s.lower() in {"none", "nan", "null", "-", "qtr", "hy", "tbd", "n/a", "na"}:
         return None
     if "%" in s:
-        s_clean = s.replace("%", "").replace(",", "").strip()
+        s_clean = s.replace("%", "").replace(",", "").strip().strip("`'\"")
         try:
             num = float(s_clean)
             target_num = None
             if target_aop is not None:
                 try:
-                    target_num = float(str(target_aop).replace("%", "").strip())
+                    target_num = float(str(target_aop).replace("%", "").strip().strip("`'\""))
                 except Exception:
                     pass
             if (target_num is not None and target_num <= 1.5) or (target_num is None and num > 1.0):
@@ -135,11 +135,11 @@ def normalize_numeric_value(val: Any, target_aop: Any = None, units: str = "") -
                     num = num / 100.0
             return num
         except Exception:
-            return val
+            return None
     try:
         return float(s.replace(",", ""))
     except Exception:
-        return val
+        return None
 
 
 def read_file_safe_bytes(file_path: Path | str) -> bytes:
