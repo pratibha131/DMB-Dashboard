@@ -2018,7 +2018,7 @@ def calculate_row_spans(total_rows, count):
     return spans
 
 
-def format_kpi_metric_display(val, unit=""):
+def format_kpi_metric_display(val, unit="", data_type=""):
     if val is None or pd.isna(val):
         return None
     try:
@@ -2026,8 +2026,24 @@ def format_kpi_metric_display(val, unit=""):
     except (ValueError, TypeError):
         u_str = f" {unit}".strip() if unit else ""
         return f"{val}{u_str}".strip()
+
+    dt_clean = str(data_type).strip().lower() if data_type and pd.notna(data_type) else ""
     unit_clean = str(unit).strip() if unit and pd.notna(unit) else ""
-    if unit_clean == "%":
+
+    # Strict Data Type precedence from Excel
+    if dt_clean in {"whole number", "wholenumber", "integer"}:
+        eff_unit = "" if unit_clean == "%" else unit_clean
+        u_str = f" {eff_unit}" if eff_unit and eff_unit.lower() not in {"no.", "no", "nos"} else ""
+        return f"{int(round(val_f))}{u_str}".strip()
+
+    if dt_clean == "decimal":
+        eff_unit = "" if unit_clean == "%" else unit_clean
+        u_str = f" {eff_unit}" if eff_unit else ""
+        if float(val_f).is_integer():
+            return f"{int(val_f)}{u_str}".strip()
+        return f"{round(val_f, 3):,f}".rstrip("0").rstrip(".") + u_str
+
+    if dt_clean == "percentage" or unit_clean == "%":
         if 0 < val_f <= 1.0:
             val_f *= 100
         return f"{val_f:.1f}%"
@@ -2697,15 +2713,19 @@ def create_rca_table(selected_month):
 
         # Get units for Target and Actual formatting
         u = str(row.get("units", "")).strip()
-        if not u:
+        dt = str(row.get("data_type", "")).strip() if pd.notna(row.get("data_type")) else ""
+        if not u or not dt:
             active_mpr = get_active_mpr_data()
-            if not active_mpr.empty and "kpi_name" in active_mpr.columns and "units" in active_mpr.columns:
+            if not active_mpr.empty and "kpi_name" in active_mpr.columns:
                 m = active_mpr[active_mpr["kpi_name"].str.strip().str.lower().eq(str(kpi_name_val).strip().lower())]
-                if not m.empty and pd.notna(m["units"].iloc[0]):
-                    u = str(m["units"].iloc[0]).strip()
+                if not m.empty:
+                    if not u and "units" in m.columns and pd.notna(m["units"].iloc[0]):
+                        u = str(m["units"].iloc[0]).strip()
+                    if not dt and "data_type" in m.columns and pd.notna(m["data_type"].iloc[0]):
+                        dt = str(m["data_type"].iloc[0]).strip()
 
-        target_disp = format_kpi_metric_display(row.get("target"), unit=u)
-        actual_disp = format_kpi_metric_display(row.get("actual"), unit=u)
+        target_disp = format_kpi_metric_display(row.get("target"), unit=u, data_type=dt)
+        actual_disp = format_kpi_metric_display(row.get("actual"), unit=u, data_type=dt)
 
         table_rows.append(
             html.Tr(
@@ -3381,8 +3401,9 @@ def create_continuous_red_detail(function_name, selected_month):
                         t_val = r.get("Target")
                         a_val = r.get("Actual")
                         u_val = r.get("units", "")
+                        dt_val = r.get("data_type", "") if "data_type" in r else ""
                         m_val = r.get("metric_nature", "")
-                        return format_kpi_metric_display(t_val, u_val), format_kpi_metric_display(a_val, u_val), m_val
+                        return format_kpi_metric_display(t_val, u_val, dt_val), format_kpi_metric_display(a_val, u_val, dt_val), m_val
             if not red_kpis.empty:
                 for _, r in red_kpis.iterrows():
                     rk_name = str(r.get("kpi_name", "")).strip()
@@ -3390,8 +3411,9 @@ def create_continuous_red_detail(function_name, selected_month):
                         t_val = r.get("Target") if "Target" in r else r.get("target")
                         a_val = r.get("Actual") if "Actual" in r else r.get("actual")
                         u_val = r.get("units", "") if "units" in r else ""
+                        dt_val = r.get("data_type", "") if "data_type" in r else ""
                         m_val = r.get("metric_nature", "") if "metric_nature" in r else ""
-                        return format_kpi_metric_display(t_val, u_val), format_kpi_metric_display(a_val, u_val), m_val
+                        return format_kpi_metric_display(t_val, u_val, dt_val), format_kpi_metric_display(a_val, u_val, dt_val), m_val
             if not review_kpis.empty:
                 rev_match = review_kpis[
                     review_kpis["function_key"].eq(selected_function_key)
@@ -3403,8 +3425,9 @@ def create_continuous_red_detail(function_name, selected_month):
                         t_val = r.get("target")
                         a_val = r.get("actual")
                         u_val = r.get("units", "") if "units" in r else ""
+                        dt_val = r.get("data_type", "") if "data_type" in r else ""
                         m_val = r.get("metric_nature", "") if "metric_nature" in r else ""
-                        return format_kpi_metric_display(t_val, u_val), format_kpi_metric_display(a_val, u_val), m_val
+                        return format_kpi_metric_display(t_val, u_val, dt_val), format_kpi_metric_display(a_val, u_val, dt_val), m_val
 
         # Pass 2: Fuzzy match
         for cand in candidates:
@@ -3415,8 +3438,9 @@ def create_continuous_red_detail(function_name, selected_month):
                         t_val = r.get("Target")
                         a_val = r.get("Actual")
                         u_val = r.get("units", "")
+                        dt_val = r.get("data_type", "") if "data_type" in r else ""
                         m_val = r.get("metric_nature", "")
-                        return format_kpi_metric_display(t_val, u_val), format_kpi_metric_display(a_val, u_val), m_val
+                        return format_kpi_metric_display(t_val, u_val, dt_val), format_kpi_metric_display(a_val, u_val, dt_val), m_val
         return None, None, None
 
     def add_card(
@@ -4014,15 +4038,26 @@ def create_kpi_trend_chart(kpi_df, kpi_name, unit_str="", metric_nature="Higher 
     df_units = str(kpi_df.get("units", "").dropna().iloc[0] if not kpi_df.empty and "units" in kpi_df.columns and not kpi_df["units"].dropna().empty else "").strip()
     df_data_type = str(kpi_df.get("data_type", "").dropna().iloc[0] if not kpi_df.empty and "data_type" in kpi_df.columns and not kpi_df["data_type"].dropna().empty else "").strip().lower()
 
-    eff_unit = unit_str if unit_str else df_units
-    if eff_unit in {"No.", "no", "nos", "Mn", "mn", "days", "k"}:
+    # Excel Data Type takes strict precedence
+    if df_data_type in {"whole number", "wholenumber", "integer"}:
         is_pct = False
-    elif eff_unit == "%" or df_data_type == "percentage":
+        eff_unit = "No." if (unit_str == "%" or df_units == "%") else (unit_str or df_units or "No.")
+    elif df_data_type == "decimal":
+        is_pct = False
+        eff_unit = "" if (unit_str == "%" or df_units == "%") else (unit_str or df_units)
+    elif df_data_type == "percentage":
         is_pct = True
-    elif ("%" in kpi_name or "percent" in kpi_name.lower()) and df_data_type != "decimal":
-        is_pct = True
+        eff_unit = "%"
     else:
-        is_pct = False
+        eff_unit = unit_str if unit_str else df_units
+        if eff_unit in {"No.", "no", "nos", "Mn", "mn", "days", "k"}:
+            is_pct = False
+        elif eff_unit == "%":
+            is_pct = True
+        elif ("%" in kpi_name or "percent" in kpi_name.lower()):
+            is_pct = True
+        else:
+            is_pct = False
 
     lower_is_better = "lower" in str(metric_nature).lower()
 
@@ -4036,11 +4071,15 @@ def create_kpi_trend_chart(kpi_df, kpi_name, unit_str="", metric_nature="Higher 
 
         if is_pct and t_val is not None and t_val <= 1.5 and t_val > 0:
             t_disp_num = round(t_val * 100, 1)
+        elif df_data_type in {"whole number", "wholenumber", "integer"} and t_val is not None:
+            t_disp_num = int(round(t_val))
         else:
             t_disp_num = round(t_val, 3) if t_val is not None else None
 
         if is_pct and a_val is not None and a_val <= 1.5 and a_val > 0:
             a_disp_num = round(a_val * 100, 1)
+        elif df_data_type in {"whole number", "wholenumber", "integer"} and a_val is not None:
+            a_disp_num = int(round(a_val))
         else:
             a_disp_num = round(a_val, 3) if a_val is not None else None
 
@@ -4050,8 +4089,8 @@ def create_kpi_trend_chart(kpi_df, kpi_name, unit_str="", metric_nature="Higher 
         if t_disp_num is not None:
             if is_pct:
                 t_str = f"{t_disp_num:.1f}%"
-            elif float(t_disp_num).is_integer():
-                t_str = f"{int(t_disp_num)}"
+            elif df_data_type in {"whole number", "wholenumber", "integer"} or float(t_disp_num).is_integer():
+                t_str = f"{int(round(t_disp_num))}"
             else:
                 t_str = f"{round(t_disp_num, 3):,f}".rstrip("0").rstrip(".")
             target_texts.append(t_str)
@@ -4061,8 +4100,8 @@ def create_kpi_trend_chart(kpi_df, kpi_name, unit_str="", metric_nature="Higher 
         if a_disp_num is not None:
             if is_pct:
                 a_str = f"{a_disp_num:.1f}%"
-            elif float(a_disp_num).is_integer():
-                a_str = f"{int(a_disp_num)}"
+            elif df_data_type in {"whole number", "wholenumber", "integer"} or float(a_disp_num).is_integer():
+                a_str = f"{int(round(a_disp_num))}"
             else:
                 a_str = f"{round(a_disp_num, 3):,f}".rstrip("0").rstrip(".")
             actual_texts.append(a_str)
@@ -4400,12 +4439,19 @@ def create_function_kpis_table_detail(function_name, selected_month):
     )
 
     # Format helpers
-    def format_val_str(val, unit, is_pct_hint=False):
+    def format_val_str(val, unit, is_pct_hint=False, data_type_hint=""):
         if val is None or pd.isna(val) or str(val).strip() in {"", "nan", "None", "—"}:
             return "—"
         try:
             num = float(val)
-            if is_pct_hint or str(unit).strip() == "%":
+            dt_hint = str(data_type_hint).strip().lower() if data_type_hint else ""
+            if dt_hint in {"whole number", "wholenumber", "integer"}:
+                return f"{int(round(num))}"
+            if dt_hint == "decimal":
+                if float(num).is_integer():
+                    return f"{int(num)}"
+                return f"{round(num, 3):,f}".rstrip("0").rstrip(".")
+            if is_pct_hint or dt_hint == "percentage" or str(unit).strip() == "%":
                 if abs(num) <= 1.5 and abs(num) > 0:
                     return f"{num * 100:.1f}%"
                 else:
@@ -4434,18 +4480,32 @@ def create_function_kpis_table_detail(function_name, selected_month):
         dt_clean = str(dt_val).strip().lower()
         k_lower = k_name.lower()
 
-        if unit_clean in {"No.", "no", "nos", "Mn", "mn", "days", "k"}:
+        # Excel Data Type takes strict precedence
+        if dt_clean in {"whole number", "wholenumber", "integer"}:
             is_pct = False
-        elif unit_clean == "%" or dt_clean == "percentage":
+            effective_unit = "No." if unit_clean == "%" or not unit_clean else unit_clean
+        elif dt_clean == "decimal":
+            is_pct = False
+            effective_unit = "" if unit_clean == "%" else unit_clean
+        elif dt_clean == "percentage":
             is_pct = True
-        elif ("%" in k_name or "percent" in k_lower) and dt_clean != "decimal":
+            effective_unit = "%"
+        elif unit_clean in {"No.", "no", "nos", "Mn", "mn", "days", "k"}:
+            is_pct = False
+            effective_unit = unit_clean
+        elif unit_clean == "%":
             is_pct = True
+            effective_unit = "%"
+        elif ("%" in k_name or "percent" in k_lower):
+            is_pct = True
+            effective_unit = "%"
         else:
             is_pct = False
+            effective_unit = unit_clean
 
-        aop_fmt = format_val_str(aop_val, unit_val, is_pct)
+        aop_fmt = format_val_str(aop_val, effective_unit, is_pct, dt_clean)
         target_aop_display = f"{op_val} {aop_fmt}".strip() if op_val else aop_fmt
-        nature_display = f"{unit_val} · {nature_val}".strip(" ·") if unit_val or nature_val else ""
+        nature_display = f"{effective_unit} · {nature_val}".strip(" ·") if effective_unit or nature_val else ""
 
         curr_record = k_hist[k_hist["month"] == selected_month]
         st_curr = curr_record["status"].iloc[0] if not curr_record.empty else "No Data"
@@ -4525,7 +4585,7 @@ def create_function_kpis_table_detail(function_name, selected_month):
         for m in all_months:
             m_rec = k_hist[k_hist["month"] == m]
             m_tgt = m_rec["Target"].iloc[0] if not m_rec.empty else None
-            t_str = format_val_str(m_tgt, unit_val, is_pct)
+            t_str = format_val_str(m_tgt, effective_unit, is_pct, dt_clean)
             is_cur = (m == selected_month)
             td_cls = "fn-trend-td fn-trend-tgt-cell" + (" fn-cell-selected-month" if is_cur else "")
             target_td_cells.append(
@@ -4543,7 +4603,7 @@ def create_function_kpis_table_detail(function_name, selected_month):
             m_rec = k_hist[k_hist["month"] == m]
             m_act = m_rec["Actual"].iloc[0] if not m_rec.empty else None
             m_st = m_rec["status"].iloc[0] if not m_rec.empty else "No Data"
-            a_str = format_val_str(m_act, unit_val, is_pct)
+            a_str = format_val_str(m_act, effective_unit, is_pct, dt_clean)
             is_cur = (m == selected_month)
 
             if m_st == "Met":
@@ -4698,9 +4758,10 @@ def get_mpr_kpis_breakdown_modal_content(month_value, filter_type="all"):
             t_raw = r.get("Target")
             a_raw = r.get("Actual")
             u = str(r.get("units", "")).strip()
+            dt = str(r.get("data_type", "")).strip() if pd.notna(r.get("data_type")) else ""
 
-            t_disp = format_kpi_metric_display(t_raw, unit=u)
-            a_disp = format_kpi_metric_display(a_raw, unit=u)
+            t_disp = format_kpi_metric_display(t_raw, unit=u, data_type=dt)
+            a_disp = format_kpi_metric_display(a_raw, unit=u, data_type=dt)
 
             is_met = pd.notna(r.get("is_met")) and bool(r.get("is_met"))
             actual_class = "mpr-actual-text-met" if is_met else "mpr-actual-text-red"

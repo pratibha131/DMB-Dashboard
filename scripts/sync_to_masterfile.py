@@ -326,7 +326,9 @@ def extract_functional_kpis(func_wb: openpyxl.Workbook) -> List[Dict[str, Any]]:
                     if "(isc)" not in display_kpi_name.lower():
                         display_kpi_name = f"{display_kpi_name} (ISC)"
 
-                data_type = determine_data_type(units, target_aop)
+                src_dt = clean_text(src_sheet.cell(r, 21).value) if src_sheet.max_column >= 21 else ""
+                has_explicit_dt = bool(src_dt)
+                data_type = src_dt if src_dt else determine_data_type(units, target_aop)
 
                 all_kpis.append({
                     "section": sec_title,
@@ -340,6 +342,7 @@ def extract_functional_kpis(func_wb: openpyxl.Workbook) -> List[Dict[str, Any]]:
                     "target_months": t_months,
                     "actual_months": a_months,
                     "data_type": data_type,
+                    "has_explicit_data_type": has_explicit_dt,
                     "category": current_category,
                     "source_sheet": src_name,
                 })
@@ -516,7 +519,10 @@ def sync_masterfile(
                         else:
                             dmb_dst_sheet.cell(r, m_i + 9, None)
 
-                    if src_kpi["data_type"]:
+                    existing_dt = clean_text(dmb_dst_sheet.cell(r, 21).value)
+                    if src_kpi.get("has_explicit_data_type") and src_kpi["data_type"]:
+                        dmb_dst_sheet.cell(r, 21, src_kpi["data_type"])
+                    elif not existing_dt and src_kpi["data_type"]:
                         dmb_dst_sheet.cell(r, 21, src_kpi["data_type"])
                     if src_kpi["category"]:
                         dmb_dst_sheet.cell(r, 22, src_kpi["category"])
