@@ -2034,10 +2034,14 @@ def format_kpi_metric_display(val, unit=""):
     elif unit_clean == "Mn":
         return f"{val_f:.2f} Mn"
     elif unit_clean.lower() in ["no.", "no", "nos"]:
-        return f"{int(val_f)}" if val_f == int(val_f) else f"{val_f:.1f}"
+        if float(val_f).is_integer():
+            return f"{int(val_f)}"
+        return f"{round(val_f, 3):,f}".rstrip("0").rstrip(".")
     else:
         suffix = f" {unit_clean}" if unit_clean else ""
-        return f"{val_f:.2f}{suffix}" if val_f % 1 != 0 else f"{int(val_f)}{suffix}"
+        if float(val_f).is_integer():
+            return f"{int(val_f)}{suffix}"
+        return f"{round(val_f, 3):,f}".rstrip("0").rstrip(".") + suffix
 
 
 def parse_num_and_unit(val):
@@ -2158,21 +2162,23 @@ def compute_kpi_delta_badge(
     elif u == "Mn":
         fmt_val = f"{arrow} {sign}{diff:.2f} Mn"
     elif u.lower() in ["no.", "no", "nos"]:
-        fmt_val = f"{arrow} {sign}{int(diff)}" if diff == int(diff) else f"{arrow} {sign}{diff:.1f}"
+        fmt_val = f"{arrow} {sign}{int(diff)}" if float(diff).is_integer() else f"{arrow} {sign}{round(diff, 3):,f}".rstrip("0").rstrip(".")
     else:
         suffix = f" {u}".rstrip() if u else ""
-        fmt_val = f"{arrow} {sign}{diff:.2f}{suffix}" if diff % 1 != 0 else f"{arrow} {sign}{int(diff)}{suffix}"
+        fmt_val = f"{arrow} {sign}{int(diff)}{suffix}" if float(diff).is_integer() else f"{arrow} {sign}{round(diff, 3):,f}".rstrip("0").rstrip(".") + suffix
 
+    diff_abs_str = f"{int(abs(diff))}" if float(abs(diff)).is_integer() else f"{round(abs(diff), 3):,f}".rstrip("0").rstrip(".")
+    diff_str = f"{int(diff)}" if float(diff).is_integer() else f"{round(diff, 3):,f}".rstrip("0").rstrip(".")
     if lower_is_better:
         if is_favorable:
-            desc = f"Actual is {abs(diff):.1f}{u} below target (Favorable for Lower-the-better metric)"
+            desc = f"Actual is {diff_abs_str}{u} below target (Favorable for Lower-the-better metric)"
         else:
-            desc = f"Actual is {diff:.1f}{u} above target (Unfavorable for Lower-the-better metric)"
+            desc = f"Actual is {diff_str}{u} above target (Unfavorable for Lower-the-better metric)"
     else:
         if is_favorable:
-            desc = f"Actual is {diff:.1f}{u} above target (Met / Exceeded Target)"
+            desc = f"Actual is {diff_str}{u} above target (Met / Exceeded Target)"
         else:
-            desc = f"Actual is {abs(diff):.1f}{u} below target (Gap / Below Target)"
+            desc = f"Actual is {diff_abs_str}{u} below target (Gap / Below Target)"
 
     return {
         "val": fmt_val,
@@ -3975,7 +3981,7 @@ def get_rca_table_content(month_value):
     )
 
 
-def create_kpi_trend_chart(kpi_df, kpi_name, unit_str="%", metric_nature="Higher the better"):
+def create_kpi_trend_chart(kpi_df, kpi_name, unit_str="", metric_nature="Higher the better"):
     if kpi_df.empty:
         fig = go.Figure()
         fig.add_annotation(
@@ -4005,12 +4011,18 @@ def create_kpi_trend_chart(kpi_df, kpi_name, unit_str="%", metric_nature="Higher
     valid_targets = kpi_df["Target"].dropna()
     valid_actuals = kpi_df["Actual"].dropna()
 
-    is_pct = (
-        unit_str == "%"
-        or ("%" in str(kpi_df.get("units", "").iloc[0] if not kpi_df.empty and "units" in kpi_df.columns else ""))
-        or (not valid_targets.empty and 0 < float(valid_targets.max()) <= 1.0)
-        or (not valid_actuals.empty and 0 < float(valid_actuals.max()) <= 1.0)
-    )
+    df_units = str(kpi_df.get("units", "").dropna().iloc[0] if not kpi_df.empty and "units" in kpi_df.columns and not kpi_df["units"].dropna().empty else "").strip()
+    df_data_type = str(kpi_df.get("data_type", "").dropna().iloc[0] if not kpi_df.empty and "data_type" in kpi_df.columns and not kpi_df["data_type"].dropna().empty else "").strip().lower()
+
+    eff_unit = unit_str if unit_str else df_units
+    if eff_unit in {"No.", "no", "nos", "Mn", "mn", "days", "k"}:
+        is_pct = False
+    elif eff_unit == "%" or df_data_type == "percentage":
+        is_pct = True
+    elif ("%" in kpi_name or "percent" in kpi_name.lower()) and df_data_type != "decimal":
+        is_pct = True
+    else:
+        is_pct = False
 
     lower_is_better = "lower" in str(metric_nature).lower()
 
@@ -4022,27 +4034,37 @@ def create_kpi_trend_chart(kpi_df, kpi_name, unit_str="%", metric_nature="Higher
         t_val = float(t_raw) if pd.notna(t_raw) else None
         a_val = float(a_raw) if pd.notna(a_raw) else None
 
-        if is_pct and t_val is not None and t_val <= 1.0:
+        if is_pct and t_val is not None and t_val <= 1.5 and t_val > 0:
             t_disp_num = round(t_val * 100, 1)
         else:
-            t_disp_num = round(t_val, 2) if t_val is not None else None
+            t_disp_num = round(t_val, 3) if t_val is not None else None
 
-        if is_pct and a_val is not None and a_val <= 1.0:
+        if is_pct and a_val is not None and a_val <= 1.5 and a_val > 0:
             a_disp_num = round(a_val * 100, 1)
         else:
-            a_disp_num = round(a_val, 2) if a_val is not None else None
+            a_disp_num = round(a_val, 3) if a_val is not None else None
 
         targets.append(t_disp_num)
         actuals.append(a_disp_num)
 
         if t_disp_num is not None:
-            t_str = f"{t_disp_num:.1f}%" if is_pct else (f"{int(t_disp_num)}" if t_disp_num == int(t_disp_num) else f"{t_disp_num:.1f}")
+            if is_pct:
+                t_str = f"{t_disp_num:.1f}%"
+            elif float(t_disp_num).is_integer():
+                t_str = f"{int(t_disp_num)}"
+            else:
+                t_str = f"{round(t_disp_num, 3):,f}".rstrip("0").rstrip(".")
             target_texts.append(t_str)
         else:
             target_texts.append(None)
 
         if a_disp_num is not None:
-            a_str = f"{a_disp_num:.1f}%" if is_pct else (f"{int(a_disp_num)}" if a_disp_num == int(a_disp_num) else f"{a_disp_num:.1f}")
+            if is_pct:
+                a_str = f"{a_disp_num:.1f}%"
+            elif float(a_disp_num).is_integer():
+                a_str = f"{int(a_disp_num)}"
+            else:
+                a_str = f"{round(a_disp_num, 3):,f}".rstrip("0").rstrip(".")
             actual_texts.append(a_str)
 
             # Polarity coloring
@@ -4383,14 +4405,17 @@ def create_function_kpis_table_detail(function_name, selected_month):
             return "—"
         try:
             num = float(val)
-            if unit == "%" or is_pct_hint or (abs(num) <= 1.5 and abs(num) > 0 and unit != "Mn"):
-                return f"{num * 100:.1f}%" if abs(num) <= 1.5 else f"{num:.1f}%"
-            elif unit == "Mn":
+            if is_pct_hint or str(unit).strip() == "%":
+                if abs(num) <= 1.5 and abs(num) > 0:
+                    return f"{num * 100:.1f}%"
+                else:
+                    return f"{num:.1f}%"
+            elif str(unit).strip() == "Mn":
                 return f"€{num:,.2f}M" if num >= 0 else f"-€{abs(num):,.2f}M"
             elif float(num).is_integer():
                 return f"{int(num)}"
             else:
-                return f"{num:,.2f}".rstrip("0").rstrip(".")
+                return f"{round(num, 3):,f}".rstrip("0").rstrip(".")
         except (ValueError, TypeError):
             return str(val)
 
@@ -4403,8 +4428,20 @@ def create_function_kpis_table_detail(function_name, selected_month):
         op_val = k_hist["operator"].dropna().iloc[0] if not k_hist["operator"].dropna().empty else ""
         aop_val = k_hist["target_aop_2026"].dropna().iloc[0] if not k_hist["target_aop_2026"].dropna().empty else ""
         nature_val = k_hist["metric_nature"].dropna().iloc[0] if not k_hist["metric_nature"].dropna().empty else ""
+        dt_val = k_hist["data_type"].dropna().iloc[0] if "data_type" in k_hist.columns and not k_hist["data_type"].dropna().empty else ""
 
-        is_pct = unit_val == "%" or "percent" in k_name.lower() or "%" in k_name or (isinstance(aop_val, (int, float)) and abs(aop_val) <= 1.0 and unit_val != "Mn")
+        unit_clean = str(unit_val).strip()
+        dt_clean = str(dt_val).strip().lower()
+        k_lower = k_name.lower()
+
+        if unit_clean in {"No.", "no", "nos", "Mn", "mn", "days", "k"}:
+            is_pct = False
+        elif unit_clean == "%" or dt_clean == "percentage":
+            is_pct = True
+        elif ("%" in k_name or "percent" in k_lower) and dt_clean != "decimal":
+            is_pct = True
+        else:
+            is_pct = False
 
         aop_fmt = format_val_str(aop_val, unit_val, is_pct)
         target_aop_display = f"{op_val} {aop_fmt}".strip() if op_val else aop_fmt
