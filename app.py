@@ -135,10 +135,8 @@ def get_active_strat_rca():
 
 
 def load_rca_actions():
-    strat_actions = load_strategic_rca_actions()
+    strat_actions = get_active_strat_rca()
     if not strat_actions.empty:
-        if "kpi_name" in strat_actions.columns:
-            strat_actions = strat_actions[~strat_actions["kpi_name"].map(is_value_lever)].copy()
         return strat_actions
 
     required_columns = [
@@ -1349,7 +1347,7 @@ app.index_string = """
         <title>{%title%}</title>
         {%favicon%}
         {%css%}
-        <script src="https://html2canvas.hertzen.com/dist/html2canvas.min.js"></script>
+        <script src="https://html2canvas.hertzen.com/dist/html2canvas.min.js" defer></script>
         <style>
             __CUSTOM_CSS__
         </style>
@@ -1962,6 +1960,11 @@ def create_function_card(function_name, current_data):
                             "continuous-red-panel continuous-red-panel-active"
                             if not_met
                             else "continuous-red-panel"
+                        ),
+                        **(
+                            {"data-rca-open-function": function_name}
+                            if not_met
+                            else {}
                         ),
                     ),
                 ],
@@ -3451,7 +3454,7 @@ def create_continuous_red_detail(function_name, selected_month):
         is_red=True,
         missing_action_text=None,
     ):
-        card_id = slug_kpi_id(f"modal-card-{red_kpi_name or title}")
+        card_id = slug_kpi_id(f"modal-card-{function_name}-{red_kpi_name or title}")
         t_disp, a_disp, m_nature = resolve_kpi_target_actual(title, red_kpi_name)
         card = create_kpi_rca_card(
             title,
@@ -3532,9 +3535,10 @@ def create_continuous_red_detail(function_name, selected_month):
                     [
                         html.Button(
                             opt["label"],
-                            id={"type": "modal-rca-kpi-pill", "target": opt["value"]},
+                            id=f"pill-{opt['value']}",
                             className="modal-rca-kpi-pill",
                             n_clicks=0,
+                            **{"data-rca-kpi-target": opt["value"]},
                         )
                         for opt in unique_modal_options
                     ],
@@ -3568,7 +3572,7 @@ def create_continuous_red_detail(function_name, selected_month):
             summary,
             html.Section(
                 section_children,
-                id="modal-root-causes",
+                id=slug_kpi_id(f"modal-root-causes-{function_name}"),
                 className="rca-workspace-section",
             ),
         ],
@@ -3898,12 +3902,14 @@ def create_trend_chart(selected_month):
 
 _memo_cache = {}
 _cached_signature = None
+_memo_lock = threading.Lock()
 
 
 def clear_dmb_cache():
     global _memo_cache, _cached_signature
-    _memo_cache.clear()
-    _cached_signature = None
+    with _memo_lock:
+        _memo_cache.clear()
+        _cached_signature = None
 
 
 def get_current_data_sig():
@@ -3913,20 +3919,29 @@ def get_current_data_sig():
         return None
 
 
+def get_sync_signature_token():
+    sig = get_current_data_sig()
+    if not sig:
+        return ""
+    return "|".join(f"{name}:{mtime}:{size}" for name, mtime, size in sig)
+
+
 def memoize_by_data_signature(func):
     def wrapper(*args):
         global _cached_signature, _memo_cache
         current_sig = get_current_data_sig()
-        if _cached_signature != current_sig:
-            _memo_cache.clear()
-            _cached_signature = current_sig
-
         cache_key = (func.__name__, args)
-        if cache_key in _memo_cache:
-            return _memo_cache[cache_key]
+        with _memo_lock:
+            if _cached_signature != current_sig:
+                _memo_cache.clear()
+                _cached_signature = current_sig
+            if cache_key in _memo_cache:
+                return _memo_cache[cache_key]
 
         result = func(*args)
-        _memo_cache[cache_key] = result
+        with _memo_lock:
+            if _cached_signature == current_sig:
+                _memo_cache[cache_key] = result
         return result
 
     return wrapper
@@ -4668,6 +4683,27 @@ def get_continuous_red_modal_content(function_name, month_value):
 
 
 @memoize_by_data_signature
+def get_dmb_rca_preloaded_views(month_value):
+    panels = []
+    for fn in FUNCTION_ORDER:
+        _, c_title, c_month, c_body = get_continuous_red_modal_content(fn, month_value)
+        slug_fn = re.sub(r"[^a-z0-9]+", "-", fn.lower()).strip("-")
+        panels.append(
+            html.Div(
+                c_body,
+                id=f"rca-preloaded-panel-{slug_fn}",
+                className="rca-preloaded-panel",
+                **{
+                    "data-rca-function": fn,
+                    "data-rca-title": c_title,
+                    "data-rca-month": c_month,
+                },
+            )
+        )
+    return panels
+
+
+@memoize_by_data_signature
 def get_function_kpis_trend_modal_content(function_name, month_value, active_kpi=None):
     selected_month = pd.Timestamp(month_value)
     return create_function_kpis_table_detail(function_name, selected_month)
@@ -4815,6 +4851,7 @@ def warmup_cache():
             m_str = def_m.strftime("%Y-%m-%d")
             get_mpr_dashboard_content(m_str)
             get_dmb_function_cards_content(m_str)
+            get_dmb_rca_preloaded_views(m_str)
             get_rca_table_content(m_str)
             for fn in ["Quality", "Regulatory", "ISC & Procurement", "R&D", "Customer Service", "Marketing"]:
                 get_continuous_red_modal_content(fn, m_str)
@@ -4827,6 +4864,7 @@ def warmup_cache():
             time.sleep(0.08)
             get_mpr_dashboard_content(m_str)
             get_dmb_function_cards_content(m_str)
+            get_dmb_rca_preloaded_views(m_str)
             get_rca_table_content(m_str)
             for fn in ["Quality", "Regulatory", "ISC & Procurement", "R&D", "Customer Service", "Marketing"]:
                 get_continuous_red_modal_content(fn, m_str)
@@ -4855,6 +4893,7 @@ def serve_layout():
 
     mpr_init = get_mpr_dashboard_content(mpr_str)
     dmb_init_cards = get_dmb_function_cards_content(dmb_str)
+    dmb_init_rca_views = get_dmb_rca_preloaded_views(dmb_str)
     rca_init_table, rca_init_month = get_rca_table_content(mpr_str)
 
     return html.Div(
@@ -4890,7 +4929,7 @@ def serve_layout():
             dcc.Store(id="active-gauge-modal-state", storage_type="memory", data={"is_open": False, "function": None, "selected_kpi": None, "month": None}),
             dcc.Store(id="active-mpr-breakdown-modal-state", storage_type="memory", data={"is_open": False, "filter": "outside", "month": None}),
             dcc.Interval(id="live-sync-interval", interval=10000, n_intervals=0),
-            dcc.Store(id="live-sync-state-store"),
+            dcc.Store(id="live-sync-state-store", data={"sig": get_sync_signature_token()}),
             html.Section(
                 [
                     html.Div(
@@ -5200,6 +5239,7 @@ def serve_layout():
                                 className="continuous-red-modal-header",
                             ),
                             html.Div(
+                                dmb_init_rca_views,
                                 id="continuous-red-modal-body",
                                 className="continuous-red-modal-body",
                             ),
@@ -5354,13 +5394,13 @@ app.layout = serve_layout
     prevent_initial_call=True,
 )
 def handle_live_sync_trigger(n_intervals, current_sync_state=None):
-    # Lightweight check: background thread updates _last_loaded
-    last_loaded = getattr(_data_store, "_last_loaded", 0.0)
-    prev_loaded = (current_sync_state or {}).get("last_loaded", 0.0)
+    # Cross-worker deterministic file-signature check (avoids multi-worker timestamp ping-pong)
+    current_sig = get_sync_signature_token()
+    prev_sig = (current_sync_state or {}).get("sig", "")
 
-    if last_loaded > 0 and last_loaded != prev_loaded:
-        clear_dmb_cache()
-        return {"last_loaded": last_loaded, "ts": time.time(), "auto": True}
+    if current_sig and current_sig != prev_sig:
+        _data_store.reload()
+        return {"sig": current_sig, "ts": time.time(), "auto": True}
 
     return no_update
 
@@ -5383,25 +5423,30 @@ def refresh_month_dropdown_options(sync_data):
     return mpr_opts, create_month_options(curr_dmb_months)
 
 
-@app.callback(
+app.clientside_callback(
+    """
+    function(mprVal, dmbVal) {
+        var nu = window.dash_clientside.no_update;
+        var ctx = window.dash_clientside.callback_context;
+        if (!ctx || !ctx.triggered || ctx.triggered.length === 0) {
+            return [nu, nu];
+        }
+        var trig = ctx.triggered[0].prop_id.split('.')[0];
+        if (trig === 'mpr-month-filter' && mprVal && mprVal !== dmbVal) {
+            return [nu, mprVal];
+        }
+        if (trig === 'dmb-month-filter' && dmbVal && dmbVal !== mprVal) {
+            return [dmbVal, nu];
+        }
+        return [nu, nu];
+    }
+    """,
     Output("mpr-month-filter", "value"),
     Output("dmb-month-filter", "value"),
     Input("mpr-month-filter", "value"),
     Input("dmb-month-filter", "value"),
     prevent_initial_call=True,
 )
-def sync_all_month_filters(mpr_val, dmb_val):
-    try:
-        ctx = dash.callback_context
-        if ctx and ctx.triggered:
-            triggered_id = ctx.triggered[0]["prop_id"].split(".")[0]
-            if triggered_id == "mpr-month-filter" and mpr_val:
-                return no_update, mpr_val
-            elif triggered_id == "dmb-month-filter" and dmb_val:
-                return dmb_val, no_update
-    except Exception:
-        pass
-    raise PreventUpdate
 
 
 # =========================================================
@@ -5427,22 +5472,11 @@ def sync_all_month_filters(mpr_val, dmb_val):
     Output("concerns-content", "children"),
     Output("concerns-count", "children"),
     Input("mpr-month-filter", "value"),
-    Input("dmb-month-filter", "value"),
     Input("live-sync-state-store", "data"),
     prevent_initial_call=True,
 )
-def update_mpr_dashboard(mpr_val, dmb_val, sync_data):
-    month_value = mpr_val or dmb_val
-    try:
-        ctx = dash.callback_context
-        if ctx and ctx.triggered:
-            trig = ctx.triggered[0]["prop_id"].split(".")[0]
-            if trig == "mpr-month-filter" and mpr_val:
-                month_value = mpr_val
-            elif trig == "dmb-month-filter" and dmb_val:
-                month_value = dmb_val
-    except Exception:
-        pass
+def update_mpr_dashboard(mpr_val, sync_data=None):
+    month_value = mpr_val or default_month.strftime("%Y-%m-%d")
     selected_month = pd.Timestamp(month_value)
     heading_title = f"{selected_month.strftime('%B')} MoS DMB Performance Review - AOP Critical"
     mpr_content = get_mpr_dashboard_content(month_value)
@@ -5450,29 +5484,22 @@ def update_mpr_dashboard(mpr_val, dmb_val, sync_data):
 
 
 # =========================================================
-# DMB FUNCTION-CARD CALLBACK (Function-wise Performance)
+# DMB FUNCTION-CARD CALLBACK (Function-wise Performance & Preloaded RCA Views)
 # =========================================================
 
 @app.callback(
     Output("function-cards-container", "children"),
+    Output("continuous-red-modal-body", "children"),
     Input("dmb-month-filter", "value"),
-    Input("mpr-month-filter", "value"),
     Input("live-sync-state-store", "data"),
     prevent_initial_call=True,
 )
-def update_dmb_function_cards(dmb_val, mpr_val, sync_data):
-    month_value = dmb_val or mpr_val
-    try:
-        ctx = dash.callback_context
-        if ctx and ctx.triggered:
-            trig = ctx.triggered[0]["prop_id"].split(".")[0]
-            if trig == "dmb-month-filter" and dmb_val:
-                month_value = dmb_val
-            elif trig == "mpr-month-filter" and mpr_val:
-                month_value = mpr_val
-    except Exception:
-        pass
-    return get_dmb_function_cards_content(month_value)
+def update_dmb_function_cards(dmb_val, sync_data=None):
+    month_value = dmb_val or default_month.strftime("%Y-%m-%d")
+    return (
+        get_dmb_function_cards_content(month_value),
+        get_dmb_rca_preloaded_views(month_value),
+    )
 
 
 # =========================================================
@@ -5483,84 +5510,18 @@ def update_dmb_function_cards(dmb_val, mpr_val, sync_data):
     Output("rca-table-container", "children"),
     Output("rca-reporting-month", "children"),
     Input("mpr-month-filter", "value"),
-    Input("dmb-month-filter", "value"),
     Input("live-sync-state-store", "data"),
     prevent_initial_call=True,
 )
-def update_rca_table(mpr_val, dmb_val, sync_data):
-    month_value = mpr_val or dmb_val
-    try:
-        ctx = dash.callback_context
-        if ctx and ctx.triggered:
-            trig = ctx.triggered[0]["prop_id"].split(".")[0]
-            if trig == "mpr-month-filter" and mpr_val:
-                month_value = mpr_val
-            elif trig == "dmb-month-filter" and dmb_val:
-                month_value = dmb_val
-    except Exception:
-        pass
+def update_rca_table(mpr_val, sync_data=None):
+    month_value = mpr_val or default_month.strftime("%Y-%m-%d")
     return get_rca_table_content(month_value)
 
 
-app.clientside_callback(
-    """
-    function(nClicksList) {
-        if (!nClicksList || nClicksList.length === 0) {
-            return window.dash_clientside.no_update;
-        }
-        var triggered = window.dash_clientside.callback_context.triggered;
-        if (!triggered || triggered.length === 0) {
-            return window.dash_clientside.no_update;
-        }
-        var trig = triggered[0];
-        if (!trig || !trig.value) {
-            return window.dash_clientside.no_update;
-        }
-        try {
-            var propId = trig.prop_id;
-            var jsonStr = propId.replace(/\\.n_clicks$/, '');
-            var parsed = JSON.parse(jsonStr);
-            var targetId = parsed.target;
-            if (targetId) {
-                var el = document.getElementById(targetId);
-                if (el) {
-                    el.scrollIntoView({ behavior: 'smooth', block: 'start' });
-                    el.classList.add('kpi-card-highlighted');
-                    setTimeout(function() {
-                        el.classList.remove('kpi-card-highlighted');
-                    }, 2500);
-                }
-            }
-        } catch(err) {
-            console.error("Scroll error:", err);
-        }
-        return window.dash_clientside.no_update;
-    }
-    """,
-    Output("continuous-red-modal-scroll-dummy", "children"),
-    Input({"type": "modal-rca-kpi-pill", "target": ALL}, "n_clicks"),
-    prevent_initial_call=True,
-)
-
-
 # =========================================================
-# CONTINUOUS-RED DETAIL MODAL CALLBACK
+# CONTINUOUS-RED DETAIL MODAL HELPER (Preloaded Client-Side Instant Modal)
 # =========================================================
 
-@app.callback(
-    Output("continuous-red-modal", "className"),
-    Output("continuous-red-modal-title", "children"),
-    Output("continuous-red-modal-month", "children"),
-    Output("continuous-red-modal-body", "children"),
-    Output("active-rca-modal-state", "data"),
-    Input({"type": "continuous-red-card", "function": ALL}, "n_clicks"),
-    Input("close-continuous-red-modal", "n_clicks"),
-    Input("continuous-red-modal-backdrop", "n_clicks"),
-    Input("dmb-month-filter", "value"),
-    Input("live-sync-state-store", "data"),
-    State("active-rca-modal-state", "data"),
-    prevent_initial_call=True,
-)
 def manage_continuous_red_modal(
     card_clicks,
     close_clicks,

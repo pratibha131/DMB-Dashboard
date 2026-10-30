@@ -1119,16 +1119,29 @@ class DMBDataStore:
                             pass
 
                 prev_source_sigs = getattr(self, "_source_sigs", None)
+                prev_master_sig = getattr(self, "_master_sig", None)
                 needs_sync = False
-                if source_sigs and (source_sigs != prev_source_sigs):
-                    needs_sync = True
-                elif force and (strat_p.exists() or func_p.exists()):
-                    needs_sync = True
 
                 if master_file and master_file.exists():
-                    m_mtime = master_file.stat().st_mtime
-                    if (strat_p.exists() and strat_p.stat().st_mtime > m_mtime) or (func_p.exists() and func_p.stat().st_mtime > m_mtime):
+                    m_stat = master_file.stat()
+                    m_mtime = m_stat.st_mtime
+                    m_sig = (m_stat.st_mtime_ns, m_stat.st_size)
+                    if (strat_p.exists() and strat_p.stat().st_mtime > m_mtime) or (
+                        func_p.exists() and func_p.stat().st_mtime > m_mtime
+                    ):
                         needs_sync = True
+                    elif (
+                        prev_source_sigs is not None
+                        and source_sigs
+                        and source_sigs != prev_source_sigs
+                        and prev_master_sig == m_sig
+                    ):
+                        needs_sync = True
+                    else:
+                        self._source_sigs = source_sigs
+                        self._master_sig = m_sig
+                elif source_sigs and master_file:
+                    needs_sync = True
 
                 if needs_sync and master_file:
                     try:
@@ -1140,6 +1153,9 @@ class DMBDataStore:
                         )
                         if sync_res.get("success"):
                             self._source_sigs = source_sigs
+                            if master_file.exists():
+                                m_stat = master_file.stat()
+                                self._master_sig = (m_stat.st_mtime_ns, m_stat.st_size)
                     except Exception as sync_err:
                         print(f"[DMBDataStore Auto-Consolidate Notice] {sync_err}")
 
