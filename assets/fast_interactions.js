@@ -1,7 +1,7 @@
 /**
  * Fast Client-Side Interactions for DMB Performance Dashboard
  * ==========================================================
- * Provides instant 0ms pre-loaded RCA modal opening/closing,
+ * Provides instant 0ms pre-loaded RCA and Function Gauge modal opening/closing,
  * smooth delegated card clicks, quick-jump KPI scrolling,
  * reliable Escape key dismissal, and tab/focus state recovery.
  */
@@ -14,14 +14,32 @@
     }
     window.__dmbFastInteractionsInitialized = true;
     window.__activeRcaFunction = null;
+    window.__activeGaugeFunction = null;
 
     var lastRcaOpenTs = 0;
+    var lastGaugeOpenTs = 0;
     var pointerDownInfo = null;
     var rafScheduled = false;
 
     function extractRcaFunction(card) {
         if (!card) return null;
         var attrFn = card.getAttribute('data-rca-open-function');
+        if (attrFn) return attrFn;
+        var rawId = card.getAttribute('id');
+        if (rawId && rawId.charAt(0) === '{') {
+            try {
+                var parsed = JSON.parse(rawId);
+                if (parsed && parsed.function) return parsed.function;
+            } catch (err) {
+                // ignore malformed id
+            }
+        }
+        return null;
+    }
+
+    function extractGaugeFunction(card) {
+        if (!card) return null;
+        var attrFn = card.getAttribute('data-gauge-open-function');
         if (attrFn) return attrFn;
         var rawId = card.getAttribute('id');
         if (rawId && rawId.charAt(0) === '{') {
@@ -118,6 +136,62 @@
         return true;
     }
 
+    function activateGaugePanelDom(functionName, resetScroll) {
+        if (!functionName) return false;
+
+        var gaugeModal = document.getElementById('function-gauge-modal');
+        var gaugeTitle = document.getElementById('function-gauge-modal-title');
+        var gaugeSubtitle = document.getElementById('function-gauge-modal-subtitle');
+        var gaugeBody = document.getElementById('function-gauge-modal-body');
+
+        if (!gaugeModal || !gaugeBody) return false;
+
+        var panels = gaugeBody.querySelectorAll('.gauge-preloaded-panel');
+        if (!panels || panels.length === 0) return false;
+
+        var targetPanel = null;
+        for (var i = 0; i < panels.length; i++) {
+            if (panels[i].getAttribute('data-gauge-function') === functionName) {
+                targetPanel = panels[i];
+                break;
+            }
+        }
+
+        if (!targetPanel) return false;
+
+        for (var j = 0; j < panels.length; j++) {
+            if (panels[j] === targetPanel) {
+                if (!panels[j].classList.contains('gauge-preloaded-panel-active')) {
+                    panels[j].classList.add('gauge-preloaded-panel-active');
+                }
+            } else if (panels[j].classList.contains('gauge-preloaded-panel-active')) {
+                panels[j].classList.remove('gauge-preloaded-panel-active');
+            }
+        }
+
+        var panelTitle = targetPanel.getAttribute('data-gauge-title') || (functionName + ' — Function KPI Performance Review');
+
+        if (gaugeTitle && gaugeTitle.textContent !== panelTitle) {
+            gaugeTitle.textContent = panelTitle;
+        }
+        if (gaugeSubtitle && gaugeSubtitle.textContent !== '') {
+            gaugeSubtitle.textContent = '';
+        }
+
+        window.__activeGaugeFunction = functionName;
+
+        if (gaugeModal.classList.contains('function-gauge-modal-hidden')) {
+            gaugeModal.classList.remove('function-gauge-modal-hidden');
+        }
+
+        if (resetScroll) {
+            gaugeBody.scrollTop = 0;
+        }
+
+        syncModalScrollLock();
+        return true;
+    }
+
     function openRcaModal(functionName, cardEl) {
         if (!functionName) return false;
         var now = Date.now();
@@ -136,12 +210,39 @@
         return activateRcaPanelDom(functionName, true);
     }
 
+    function openGaugeModal(functionName, cardEl) {
+        if (!functionName) return false;
+        var now = Date.now();
+        if (now - lastGaugeOpenTs < 80 && window.__activeGaugeFunction === functionName) {
+            return true;
+        }
+        lastGaugeOpenTs = now;
+
+        if (cardEl) {
+            cardEl.classList.add('card-clicking');
+            setTimeout(function () {
+                cardEl.classList.remove('card-clicking');
+            }, 180);
+        }
+
+        return activateGaugePanelDom(functionName, true);
+    }
+
     function closeRcaModal() {
         var rcaModal = document.getElementById('continuous-red-modal');
         if (rcaModal && !rcaModal.classList.contains('continuous-red-modal-hidden')) {
             rcaModal.classList.add('continuous-red-modal-hidden');
         }
         window.__activeRcaFunction = null;
+        syncModalScrollLock();
+    }
+
+    function closeGaugeModal() {
+        var gaugeModal = document.getElementById('function-gauge-modal');
+        if (gaugeModal && !gaugeModal.classList.contains('function-gauge-modal-hidden')) {
+            gaugeModal.classList.add('function-gauge-modal-hidden');
+        }
+        window.__activeGaugeFunction = null;
         syncModalScrollLock();
     }
 
@@ -155,6 +256,14 @@
                 window.__activeRcaFunction = null;
             }
         }
+        if (window.__activeGaugeFunction) {
+            var gaugeModal = document.getElementById('function-gauge-modal');
+            if (gaugeModal && !gaugeModal.classList.contains('function-gauge-modal-hidden')) {
+                activateGaugePanelDom(window.__activeGaugeFunction, false);
+            } else {
+                window.__activeGaugeFunction = null;
+            }
+        }
         syncModalScrollLock();
     }
 
@@ -166,7 +275,7 @@
     }
 
     // ----------------------------------------------------
-    // 1. Micro-slip Tolerant Pointer Tracking on RCA Cards
+    // 1. Micro-slip Tolerant Pointer Tracking on Cards
     // ----------------------------------------------------
     document.addEventListener('pointerdown', function (e) {
         if (e.button !== undefined && e.button !== 0) return;
@@ -175,8 +284,24 @@
             var fn = extractRcaFunction(rcaCard);
             if (fn) {
                 pointerDownInfo = {
+                    type: 'rca',
                     fn: fn,
                     card: rcaCard,
+                    x: e.clientX,
+                    y: e.clientY,
+                    ts: Date.now()
+                };
+                return;
+            }
+        }
+        var gaugeCard = e.target && e.target.closest ? e.target.closest('.mini-gauge-container-clickable') : null;
+        if (gaugeCard && !gaugeCard.disabled) {
+            var gFn = extractGaugeFunction(gaugeCard);
+            if (gFn) {
+                pointerDownInfo = {
+                    type: 'gauge',
+                    fn: gFn,
+                    card: gaugeCard,
                     x: e.clientX,
                     y: e.clientY,
                     ts: Date.now()
@@ -197,12 +322,16 @@
         var dx = Math.abs(e.clientX - info.x);
         var dy = Math.abs(e.clientY - info.y);
 
-        // If user pressed on an active RCA card and released with minimal movement,
-        // ensure it opens even if the pointer slipped a few pixels off the button edge
-        // or the card re-rendered between pointerdown and pointerup.
-        var upRcaCard = e.target && e.target.closest ? e.target.closest('.continuous-red-panel-active') : null;
-        if (!upRcaCard && dt < 450 && dx < 24 && dy < 24) {
-            openRcaModal(info.fn, info.card);
+        if (info.type === 'rca') {
+            var upRcaCard = e.target && e.target.closest ? e.target.closest('.continuous-red-panel-active') : null;
+            if (!upRcaCard && dt < 450 && dx < 24 && dy < 24) {
+                openRcaModal(info.fn, info.card);
+            }
+        } else if (info.type === 'gauge') {
+            var upGaugeCard = e.target && e.target.closest ? e.target.closest('.mini-gauge-container-clickable') : null;
+            if (!upGaugeCard && dt < 450 && dx < 24 && dy < 24) {
+                openGaugeModal(info.fn, info.card);
+            }
         }
     }, true);
 
@@ -233,7 +362,27 @@
             return;
         }
 
-        // C. Quick Jump to KPI Pill inside RCA Modal
+        // C. Open Function Gauge Modal instantly from Preloaded DOM
+        var gaugeCard = target.closest('.mini-gauge-container-clickable');
+        if (gaugeCard && !gaugeCard.disabled) {
+            var gFn = extractGaugeFunction(gaugeCard);
+            if (gFn && openGaugeModal(gFn, gaugeCard)) {
+                e.preventDefault();
+                e.stopPropagation();
+                return;
+            }
+        }
+
+        // D. Close Function Gauge Modal instantly (Back button or Backdrop)
+        var gaugeClose = target.closest('#close-function-gauge-modal, #function-gauge-modal-backdrop');
+        if (gaugeClose) {
+            closeGaugeModal();
+            e.preventDefault();
+            e.stopPropagation();
+            return;
+        }
+
+        // E. Quick Jump to KPI Pill inside RCA Modal
         var kpiPill = target.closest('.modal-rca-kpi-pill');
         if (kpiPill) {
             var targetId = kpiPill.getAttribute('data-rca-kpi-target');
@@ -263,17 +412,7 @@
             }
         }
 
-        // D. Instant Visual Feedback on Function Gauge Cards
-        var gaugeCard = target.closest('.mini-gauge-container-clickable');
-        if (gaugeCard && !gaugeCard.disabled) {
-            gaugeCard.classList.add('card-clicking');
-            setTimeout(function () {
-                gaugeCard.classList.remove('card-clicking');
-            }, 220);
-            return;
-        }
-
-        // E. Navigation Tabs
+        // F. Navigation Tabs
         var tabMpr = target.closest('#nav-tab-mpr');
         if (tabMpr) {
             e.preventDefault();
@@ -302,7 +441,7 @@
             return;
         }
 
-        // F. Smooth Scroll on Summary Cards with data-scroll-target
+        // G. Smooth Scroll on Summary Cards with data-scroll-target
         var scrollCard = target.closest('[data-scroll-target]');
         if (scrollCard) {
             if (target.tagName === 'SELECT' || target.tagName === 'INPUT' || target.tagName === 'BUTTON') {
@@ -331,8 +470,7 @@
 
             var gaugeModal = document.getElementById('function-gauge-modal');
             if (gaugeModal && !gaugeModal.classList.contains('function-gauge-modal-hidden')) {
-                var gaugeClose = document.getElementById('close-function-gauge-modal');
-                if (gaugeClose) gaugeClose.click();
+                closeGaugeModal();
                 return;
             }
 

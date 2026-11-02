@@ -104,16 +104,24 @@ _data_store = data_loader.get_data_store()
 _data_store.reload()
 
 
+_active_df_cache = {"mpr_id": None, "mpr_df": None, "strat_id": None, "strat_df": None}
+
+
 def get_active_mpr_data():
     df = _data_store.get_mpr_data()
+    df_id = id(df)
+    if _active_df_cache["mpr_id"] == df_id and _active_df_cache["mpr_df"] is not None:
+        return _active_df_cache["mpr_df"]
     if not df.empty and "kpi_name" in df.columns:
-        df = df[~df["kpi_name"].map(is_value_lever)].copy()
-        if "strategic_imperative" in df.columns:
-            df.loc[
-                df["kpi_name"].str.strip().str.lower().str.startswith("win rate"),
+        filtered = df[~df["kpi_name"].map(is_value_lever)].copy()
+        if "strategic_imperative" in filtered.columns:
+            filtered.loc[
+                filtered["kpi_name"].str.strip().str.lower().str.startswith("win rate"),
                 "strategic_imperative",
             ] = "Drive growth through Commercial Excellence"
-        return df
+        _active_df_cache["mpr_id"] = df_id
+        _active_df_cache["mpr_df"] = filtered
+        return filtered
     return df
 
 
@@ -123,14 +131,19 @@ def get_active_dmb_data():
 
 def get_active_strat_rca():
     df = _data_store.get_strat_rca()
+    df_id = id(df)
+    if _active_df_cache["strat_id"] == df_id and _active_df_cache["strat_df"] is not None:
+        return _active_df_cache["strat_df"]
     if not df.empty and "kpi_name" in df.columns:
-        df = df[~df["kpi_name"].map(is_value_lever)].copy()
-        if "strategic_imperative" in df.columns:
-            df.loc[
-                df["kpi_name"].str.strip().str.lower().str.startswith("win rate"),
+        filtered = df[~df["kpi_name"].map(is_value_lever)].copy()
+        if "strategic_imperative" in filtered.columns:
+            filtered.loc[
+                filtered["kpi_name"].str.strip().str.lower().str.startswith("win rate"),
                 "strategic_imperative",
             ] = "Drive growth through Commercial Excellence"
-        return df
+        _active_df_cache["strat_id"] = df_id
+        _active_df_cache["strat_df"] = filtered
+        return filtered
     return df
 
 
@@ -1159,7 +1172,13 @@ _function_rca_lock = threading.Lock()
 _function_rca_cache = {"signature": None, "data": None}
 
 
+_sig_ttl_cache = {"ts": 0.0, "sig": None}
+
+
 def data_folder_signature():
+    now = time.monotonic()
+    if _sig_ttl_cache["sig"] is not None and (now - _sig_ttl_cache["ts"]) < 1.5:
+        return _sig_ttl_cache["sig"]
     signature = []
     for file_path in sorted((BASE_DIR / "data").glob("*.xlsx")):
         if file_path.name.startswith("~$"):
@@ -1171,7 +1190,10 @@ def data_folder_signature():
         signature.append(
             (file_path.name, file_stat.st_mtime_ns, file_stat.st_size)
         )
-    return tuple(signature)
+    res = tuple(signature)
+    _sig_ttl_cache["ts"] = now
+    _sig_ttl_cache["sig"] = res
+    return res
 
 
 def get_function_rca_data():
@@ -1836,6 +1858,7 @@ def create_function_card(function_name, current_data):
                             n_clicks=0,
                             className="mini-gauge-container mini-gauge-container-clickable",
                             title=f"Click to view {function_name} KPI definitions and trends",
+                            **{"data-gauge-open-function": function_name},
                         ),
                         html.Button(
                             [
@@ -1934,6 +1957,7 @@ def create_function_card(function_name, current_data):
                         n_clicks=0,
                         className="mini-gauge-container mini-gauge-container-clickable",
                         title=f"Click to view {function_name} KPI definitions and 6-month trends",
+                        **{"data-gauge-open-function": function_name},
                     ),
                     html.Button(
                         [
@@ -4411,7 +4435,6 @@ def create_function_kpis_table_detail(function_name, selected_month):
                     html.Div(
                         [
                             html.Span("TOTAL KPIS", className="fn-stat-label"),
-                            html.Span(f"{function_name} Scope", className="fn-stat-sub"),
                         ],
                         className="fn-stat-info",
                     ),
@@ -4424,7 +4447,6 @@ def create_function_kpis_table_detail(function_name, selected_month):
                     html.Div(
                         [
                             html.Span(f"MET IN {selected_month.strftime('%b').upper()}", className="fn-stat-label"),
-                            html.Span("On-Target Benchmark", className="fn-stat-sub"),
                         ],
                         className="fn-stat-info",
                     ),
@@ -4437,7 +4459,6 @@ def create_function_kpis_table_detail(function_name, selected_month):
                     html.Div(
                         [
                             html.Span(f"NOT MET IN {selected_month.strftime('%b').upper()}", className="fn-stat-label"),
-                            html.Span("Performance Gap / Red", className="fn-stat-sub"),
                         ],
                         className="fn-stat-info",
                     ),
@@ -4450,7 +4471,6 @@ def create_function_kpis_table_detail(function_name, selected_month):
                     html.Div(
                         [
                             html.Span("MET RATE", className="fn-stat-label"),
-                            html.Span(f"{selected_month.strftime('%B %Y')} Compliance", className="fn-stat-sub"),
                         ],
                         className="fn-stat-info",
                     ),
@@ -4718,6 +4738,27 @@ def get_function_kpis_trend_modal_content(function_name, month_value, active_kpi
     return create_function_kpis_table_detail(function_name, selected_month)
 
 
+@memoize_by_data_signature
+def get_dmb_gauge_preloaded_views(month_value):
+    panels = []
+    for fn in FUNCTION_ORDER:
+        c_body = get_function_kpis_trend_modal_content(fn, month_value)
+        c_title = f"{fn} — Function KPI Performance Review"
+        slug_fn = re.sub(r"[^a-z0-9]+", "-", fn.lower()).strip("-")
+        panels.append(
+            html.Div(
+                c_body,
+                id=f"gauge-preloaded-panel-{slug_fn}",
+                className="gauge-preloaded-panel",
+                **{
+                    "data-gauge-function": fn,
+                    "data-gauge-title": c_title,
+                },
+            )
+        )
+    return panels
+
+
 def create_mpr_breakdown_pills(summary, active_filter="all"):
     pills_config = [
         ("all", "All Critical KPIs", summary.get("total_kpis", 0), "pill-all"),
@@ -4847,6 +4888,40 @@ def get_mpr_kpis_breakdown_modal_content(month_value, filter_type="all"):
     return title, subtitle, pills, table_content
 
 
+@memoize_by_data_signature
+def get_all_months_dashboard_bundle():
+    active_mpr = get_active_mpr_data()
+    active_dmb = get_active_dmb_data()
+    active_strat = get_active_rca_actions()
+    curr_mpr_months, curr_default_mpr_month = get_dynamic_reporting_months(active_mpr, active_strat)
+    curr_dmb_months, _ = get_dynamic_reporting_months(active_dmb, active_strat)
+    all_months = sorted(set(curr_mpr_months + curr_dmb_months))
+    months_dict = {}
+    for m in all_months:
+        m_ts = pd.Timestamp(m)
+        m_str = m_ts.strftime("%Y-%m-%d")
+        heading_title = f"{m_ts.strftime('%B')} MoS DMB Performance Review - AOP Critical"
+        mpr_c = get_mpr_dashboard_content(m_str)
+        dmb_c = get_dmb_function_cards_content(m_str)
+        rca_t, rca_m = get_rca_table_content(m_str)
+        rca_views = get_dmb_rca_preloaded_views(m_str)
+        gauge_views = get_dmb_gauge_preloaded_views(m_str)
+        months_dict[m_str] = {
+            "heading_title": heading_title,
+            "mpr": list(mpr_c),
+            "dmb_cards": dmb_c,
+            "rca_table": rca_t,
+            "rca_month": rca_m,
+            "rca_views": rca_views,
+            "gauge_views": gauge_views,
+        }
+    return {
+        "sig": get_sync_signature_token(),
+        "default_month": curr_default_mpr_month.strftime("%Y-%m-%d"),
+        "months": months_dict,
+    }
+
+
 def warmup_cache():
     try:
         active_mpr = get_active_mpr_data()
@@ -4854,30 +4929,26 @@ def warmup_cache():
         active_strat = get_active_rca_actions()
         mpr_months, default_mpr_m = get_dynamic_reporting_months(active_mpr, active_strat)
         dmb_months, default_dmb_m = get_dynamic_reporting_months(active_dmb, active_strat)
-        
-        # 1. Warm up default reporting months first immediately (< 50ms)
+
+        # 1. Warm up default reporting months immediately
         for def_m in set([default_dmb_m, default_mpr_m]):
             m_str = def_m.strftime("%Y-%m-%d")
             get_mpr_dashboard_content(m_str)
             get_dmb_function_cards_content(m_str)
             get_dmb_rca_preloaded_views(m_str)
+            get_dmb_gauge_preloaded_views(m_str)
             get_rca_table_content(m_str)
-            for fn in ["Quality", "Regulatory", "ISC & Procurement", "R&D", "Customer Service", "Marketing"]:
-                get_continuous_red_modal_content(fn, m_str)
-                get_function_kpis_trend_modal_content(fn, m_str)
-                
-        # 2. Warm up remaining months in background gently with small yield
+
+        # 2. Warm up all months and the complete instant-switch bundle with zero sleep delay
         all_months = sorted(set(mpr_months + dmb_months))
         for m in all_months:
             m_str = m.strftime("%Y-%m-%d")
-            time.sleep(0.08)
             get_mpr_dashboard_content(m_str)
             get_dmb_function_cards_content(m_str)
             get_dmb_rca_preloaded_views(m_str)
+            get_dmb_gauge_preloaded_views(m_str)
             get_rca_table_content(m_str)
-            for fn in ["Quality", "Regulatory", "ISC & Procurement", "R&D", "Customer Service", "Marketing"]:
-                get_continuous_red_modal_content(fn, m_str)
-                get_function_kpis_trend_modal_content(fn, m_str)
+        get_all_months_dashboard_bundle()
     except Exception as e:
         print(f"[Cache Warmup Notice] {e}")
 
@@ -4903,6 +4974,7 @@ def serve_layout():
     mpr_init = get_mpr_dashboard_content(mpr_str)
     dmb_init_cards = get_dmb_function_cards_content(dmb_str)
     dmb_init_rca_views = get_dmb_rca_preloaded_views(dmb_str)
+    dmb_init_gauge_views = get_dmb_gauge_preloaded_views(dmb_str)
     rca_init_table, rca_init_month = get_rca_table_content(mpr_str)
 
     return html.Div(
@@ -4939,6 +5011,7 @@ def serve_layout():
             dcc.Store(id="active-mpr-breakdown-modal-state", storage_type="memory", data={"is_open": False, "filter": "outside", "month": None}),
             dcc.Interval(id="live-sync-interval", interval=10000, n_intervals=0),
             dcc.Store(id="live-sync-state-store", data={"sig": get_sync_signature_token()}),
+            dcc.Store(id="all-months-dashboard-store", storage_type="memory"),
             html.Section(
                 [
                     html.Div(
@@ -5280,10 +5353,6 @@ def serve_layout():
                                     html.Div(
                                         [
                                             html.Div(
-                                                html.Span("📈", className="trend-header-icon"),
-                                                className="trend-header-icon-wrap",
-                                            ),
-                                            html.Div(
                                                 [
                                                     html.H2(
                                                         id="function-gauge-modal-title"
@@ -5317,6 +5386,7 @@ def serve_layout():
                                 className="function-gauge-modal-header",
                             ),
                             html.Div(
+                                dmb_init_gauge_views,
                                 id="function-gauge-modal-body",
                                 className="function-gauge-modal-body",
                             ),
@@ -5432,37 +5502,76 @@ def refresh_month_dropdown_options(sync_data):
     return mpr_opts, create_month_options(curr_dmb_months)
 
 
+@app.callback(
+    Output("all-months-dashboard-store", "data"),
+    Input("live-sync-state-store", "data"),
+)
+def populate_all_months_store(sync_data=None):
+    return get_all_months_dashboard_bundle()
+
+
 app.clientside_callback(
     """
-    function(mprVal, dmbVal) {
+    function(mprVal, dmbVal, storeData) {
         var nu = window.dash_clientside.no_update;
+        var noUpdates = new Array(24).fill(nu);
         var ctx = window.dash_clientside.callback_context;
-        if (!ctx || !ctx.triggered || ctx.triggered.length === 0) {
-            return [nu, nu];
+        var trig = (ctx && ctx.triggered && ctx.triggered.length > 0)
+            ? ctx.triggered[0].prop_id.split('.')[0]
+            : '';
+
+        var targetMonth = mprVal || dmbVal;
+        if (trig === 'mpr-month-filter' && mprVal) {
+            targetMonth = mprVal;
+        } else if (trig === 'dmb-month-filter' && dmbVal) {
+            targetMonth = dmbVal;
         }
-        var trig = ctx.triggered[0].prop_id.split('.')[0];
-        if (trig === 'mpr-month-filter' && mprVal && mprVal !== dmbVal) {
-            return [nu, mprVal];
+
+        if (!storeData || !storeData.months || !targetMonth || !storeData.months[targetMonth]) {
+            if (trig === 'mpr-month-filter' && mprVal && mprVal !== dmbVal) {
+                var r1 = noUpdates.slice();
+                r1[1] = mprVal;
+                return r1;
+            }
+            if (trig === 'dmb-month-filter' && dmbVal && dmbVal !== mprVal) {
+                var r2 = noUpdates.slice();
+                r2[0] = dmbVal;
+                return r2;
+            }
+            return noUpdates;
         }
-        if (trig === 'dmb-month-filter' && dmbVal && dmbVal !== mprVal) {
-            return [dmbVal, nu];
+
+        if (trig === 'all-months-dashboard-store') {
+            if (!window.__dmbRenderedSig) {
+                window.__dmbRenderedSig = storeData.sig;
+                if (targetMonth === storeData.default_month && mprVal === dmbVal) {
+                    return noUpdates;
+                }
+            } else if (window.__dmbRenderedSig === storeData.sig) {
+                return noUpdates;
+            }
+            window.__dmbRenderedSig = storeData.sig;
         }
-        return [nu, nu];
+
+        var entry = storeData.months[targetMonth];
+        var mpr = entry.mpr;
+        return [
+            targetMonth === mprVal ? nu : targetMonth,
+            targetMonth === dmbVal ? nu : targetMonth,
+            entry.heading_title,
+            mpr[0], mpr[1], mpr[2], mpr[3], mpr[4],
+            mpr[5], mpr[6], mpr[7], mpr[8], mpr[9],
+            mpr[10], mpr[11], mpr[12], mpr[13], mpr[14], mpr[15],
+            entry.dmb_cards,
+            entry.rca_table,
+            entry.rca_month,
+            entry.rca_views,
+            entry.gauge_views
+        ];
     }
     """,
     Output("mpr-month-filter", "value"),
     Output("dmb-month-filter", "value"),
-    Input("mpr-month-filter", "value"),
-    Input("dmb-month-filter", "value"),
-    prevent_initial_call=True,
-)
-
-
-# =========================================================
-# MPR CALLBACK (Executive MoS & Imperative Performance)
-# =========================================================
-
-@app.callback(
     Output("dashboard-header-title", "children"),
     Output("mpr-total-kpis", "children"),
     Output("mpr-met-kpis", "children"),
@@ -5480,11 +5589,23 @@ app.clientside_callback(
     Output("lowlights-count", "children"),
     Output("concerns-content", "children"),
     Output("concerns-count", "children"),
+    Output("function-cards-container", "children"),
+    Output("rca-table-container", "children"),
+    Output("rca-reporting-month", "children"),
+    Output("continuous-red-modal-body", "children"),
+    Output("function-gauge-modal-body", "children"),
     Input("mpr-month-filter", "value"),
-    Input("live-sync-state-store", "data"),
+    Input("dmb-month-filter", "value"),
+    Input("all-months-dashboard-store", "data"),
     prevent_initial_call=True,
 )
-def update_mpr_dashboard(mpr_val, sync_data=None):
+
+
+# =========================================================
+# PYTHON SECTION HELPERS (Used by Store & Unit Tests)
+# =========================================================
+
+def update_mpr_dashboard(mpr_val, sync_data=None, extra=None):
     month_value = mpr_val or default_month.strftime("%Y-%m-%d")
     selected_month = pd.Timestamp(month_value)
     heading_title = f"{selected_month.strftime('%B')} MoS DMB Performance Review - AOP Critical"
@@ -5492,37 +5613,12 @@ def update_mpr_dashboard(mpr_val, sync_data=None):
     return (heading_title, *mpr_content)
 
 
-# =========================================================
-# DMB FUNCTION-CARD CALLBACK (Function-wise Performance & Preloaded RCA Views)
-# =========================================================
-
-@app.callback(
-    Output("function-cards-container", "children"),
-    Output("continuous-red-modal-body", "children"),
-    Input("dmb-month-filter", "value"),
-    Input("live-sync-state-store", "data"),
-    prevent_initial_call=True,
-)
-def update_dmb_function_cards(dmb_val, sync_data=None):
+def update_dmb_function_cards(dmb_val, sync_data=None, extra=None):
     month_value = dmb_val or default_month.strftime("%Y-%m-%d")
-    return (
-        get_dmb_function_cards_content(month_value),
-        get_dmb_rca_preloaded_views(month_value),
-    )
+    return get_dmb_function_cards_content(month_value)
 
 
-# =========================================================
-# RCA CALLBACK (MoS Level Cause & Actions)
-# =========================================================
-
-@app.callback(
-    Output("rca-table-container", "children"),
-    Output("rca-reporting-month", "children"),
-    Input("mpr-month-filter", "value"),
-    Input("live-sync-state-store", "data"),
-    prevent_initial_call=True,
-)
-def update_rca_table(mpr_val, sync_data=None):
+def update_rca_table(mpr_val, sync_data=None, extra=None):
     month_value = mpr_val or default_month.strftime("%Y-%m-%d")
     return get_rca_table_content(month_value)
 
@@ -5648,27 +5744,14 @@ def manage_continuous_red_modal(
 # FUNCTION GAUGE KPI DEFINITIONS & TREND MODAL CALLBACK
 # =========================================================
 
-@app.callback(
-    Output("function-gauge-modal", "className"),
-    Output("function-gauge-modal-title", "children"),
-    Output("function-gauge-modal-subtitle", "children"),
-    Output("function-gauge-modal-body", "children"),
-    Output("active-gauge-modal-state", "data"),
-    Input({"type": "function-gauge-card", "function": ALL}, "n_clicks"),
-    Input("close-function-gauge-modal", "n_clicks"),
-    Input("function-gauge-modal-backdrop", "n_clicks"),
-    Input("dmb-month-filter", "value"),
-    Input("live-sync-state-store", "data"),
-    State("active-gauge-modal-state", "data"),
-    prevent_initial_call=True,
-)
 def manage_function_gauge_modal(
     gauge_card_clicks,
     close_clicks,
     backdrop_clicks,
     month_filter_val,
-    sync_data,
-    current_modal_state,
+    sync_data=None,
+    current_modal_state=None,
+    month_state=None,
 ):
     ctx_inst = dash.callback_context
     current_modal_state = current_modal_state or {
@@ -5744,7 +5827,7 @@ def manage_function_gauge_modal(
         return (
             "function-gauge-modal",
             f"{clicked_gauge_fn} — Function KPI Performance Review",
-            f"All Key Performance Indicators · {sel_dt.strftime('%B %Y')}",
+            "",
             detail_content,
             {
                 "is_open": True,
@@ -5764,7 +5847,7 @@ def manage_function_gauge_modal(
             return (
                 "function-gauge-modal",
                 f"{func_name} — Function KPI Performance Review",
-                f"All Key Performance Indicators · {sel_dt.strftime('%B %Y')}",
+                "",
                 detail_content,
                 {
                     "is_open": True,
@@ -6016,9 +6099,14 @@ app.clientside_callback(
     prevent_initial_call=True,
 )
 # Starts the 24/7 background SharePoint Live Sync Engine
-sharepoint_sync.start_live_sync(
-    callback=lambda: data_loader.reload_all_data(force=True)
-)
+def _on_live_sync_reload():
+    data_loader.reload_all_data(force=True)
+    _sig_ttl_cache["ts"] = 0.0
+    _sig_ttl_cache["sig"] = None
+    threading.Thread(target=warmup_cache, daemon=True).start()
+
+
+sharepoint_sync.start_live_sync(callback=_on_live_sync_reload)
 
 if __name__ == "__main__":
     app.run(

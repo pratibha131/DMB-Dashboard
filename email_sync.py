@@ -339,6 +339,11 @@ def push_to_github_if_configured(filename: str, content: bytes) -> bool:
         logger.debug("GITHUB_TOKEN not configured; skipping automatic GitHub commit.")
         return False
 
+    # When running locally inside a git working tree (not on Azure), avoid out-of-band REST API commits
+    # that advance origin/main ahead of the developer's local git branch (causing non-fast-forward on git push).
+    if (BASE_DIR / ".git").exists() and not _env("WEBSITE_SITE_NAME") and _env("FORCE_GITHUB_API_PUSH").lower() != "true":
+        return False
+
     # If pushing masterfile, ensure it is complete and valid
     if "masterfile" in filename.lower():
         try:
@@ -487,7 +492,7 @@ def pull_from_github_if_updated() -> List[str]:
         except Exception as e:
             logger.debug("GitHub poll check notice for %s: %s", filename, e)
 
-    return updated_files
+    return len(updated_files), updated_files
 
 
 def load_mailbox_config() -> dict:

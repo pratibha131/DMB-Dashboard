@@ -136,7 +136,7 @@ class TestAtomicModalCallbacks(unittest.TestCase):
             
             self.assertEqual(g_class, "function-gauge-modal")
             self.assertIn("Quality", g_title)
-            self.assertIn("August 2026", g_subtitle)
+            self.assertEqual(g_subtitle, "")
             self.assertIsNotNone(g_body)
             self.assertTrue(active_state["is_open"])
             self.assertEqual(active_state["function"], "Quality")
