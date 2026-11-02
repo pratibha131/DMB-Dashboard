@@ -607,13 +607,13 @@ def sync_once(resolve_target: Callable[[str], Path] | None = None) -> Tuple[int,
             seen_ids = set()
             ordered_ids = []
 
-            # Search UNSEEN first, then targeted subject query
-            search_queries = [
-                '(OR (OR SUBJECT "SharePoint" SUBJECT "DMB") (OR SUBJECT "Strategic" SUBJECT "Functional"))',
+            # Always search both UNSEEN and targeted subject queries so no unread email is ever missed,
+            # falling back to ALL only if neither returns any messages.
+            primary_queries = [
                 'UNSEEN',
-                'ALL',
+                '(OR (OR SUBJECT "SharePoint" SUBJECT "DMB") (OR SUBJECT "Strategic" SUBJECT "Functional"))',
             ]
-            for query in search_queries:
+            for query in primary_queries:
                 try:
                     status, data = imap.search(None, query)
                     if status == "OK" and data and data[0]:
@@ -621,8 +621,17 @@ def sync_once(resolve_target: Callable[[str], Path] | None = None) -> Tuple[int,
                             if msg_id not in seen_ids:
                                 seen_ids.add(msg_id)
                                 ordered_ids.append(msg_id)
-                        if ordered_ids:
-                            break
+                except Exception:
+                    pass
+
+            if not ordered_ids:
+                try:
+                    status, data = imap.search(None, 'ALL')
+                    if status == "OK" and data and data[0]:
+                        for msg_id in data[0].split():
+                            if msg_id not in seen_ids:
+                                seen_ids.add(msg_id)
+                                ordered_ids.append(msg_id)
                 except Exception:
                     pass
 
@@ -724,8 +733,12 @@ def sync_once(resolve_target: Callable[[str], Path] | None = None) -> Tuple[int,
                             existing_bytes = read_file_safe_bytes(target)
                             if existing_bytes == payload:
                                 is_new = False
-                            elif compute_git_blob_sha(payload) in _sync_state.get("seen_blob_shas", {}).get(target_name, []):
-                                # We have already seen this exact attachment blob in the past; do not revert to it!
+                            elif (
+                                not is_unseen
+                                and msg_unique_key in processed_keys
+                                and compute_git_blob_sha(payload) in _sync_state.get("seen_blob_shas", {}).get(target_name, [])
+                            ):
+                                # We have already seen this exact attachment blob in a previously processed email; do not revert to it!
                                 is_new = False
                         except Exception:
                             pass
