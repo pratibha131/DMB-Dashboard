@@ -1319,9 +1319,18 @@ app = Dash(
 server = app.server
 
 
+@server.route("/health", methods=["GET"])
+def health_check_endpoint():
+    return (
+        json.dumps({"status": "healthy", "sig": get_sync_signature_token()}),
+        200,
+        {"Content-Type": "application/json"},
+    )
+
+
 @server.route("/api/sync", methods=["GET", "POST"])
 def api_sync_endpoint():
-    res = sharepoint_sync.sync_now()
+    res = sharepoint_sync.sync_now(force_remote=True)
     data_loader.reload_all_data(force=True)
     return json.dumps(res), 200, {"Content-Type": "application/json"}
 
@@ -5786,6 +5795,7 @@ def manage_function_gauge_modal(
     Input("close-mpr-breakdown-modal", "n_clicks"),
     Input("mpr-breakdown-modal-backdrop", "n_clicks"),
     Input("mpr-month-filter", "value"),
+    Input("live-sync-state-store", "data"),
     State("active-mpr-breakdown-modal-state", "data"),
     prevent_initial_call=True,
 )
@@ -5798,7 +5808,8 @@ def manage_mpr_breakdown_modal(
     close_clicks,
     backdrop_clicks,
     month_val,
-    current_state,
+    sync_data=None,
+    current_state=None,
 ):
     ctx_inst = dash.callback_context
     if not ctx_inst or not ctx_inst.triggered:
@@ -5843,8 +5854,8 @@ def manage_mpr_breakdown_modal(
     elif trig_id == "card-mpr-total-kpis" and total_clicks:
         target_filter = "all"
 
-    # 4. Month filter changed while modal is open
-    if trig_id == "mpr-month-filter":
+    # 4. Month filter or Live Sync changed while modal is open
+    if trig_id in ("mpr-month-filter", "live-sync-state-store"):
         if current_state.get("is_open"):
             target_filter = current_state.get("filter", "all")
         else:

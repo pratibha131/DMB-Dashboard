@@ -11,6 +11,7 @@ Key Features:
 - Consolidates all 10 function tabs from Functional DMB Review Sheets into all 9 DMB sections.
 - Preserves full 200+ row structure, 22 columns, formatting, and live monthly actuals/targets.
 - Strict validation: rejects any sync result with <180 DMB rows or <45 MPR rows to prevent data loss.
+- Content-aware comparison: ignores openpyxl internal ZIP timestamps when cell data is unchanged.
 - Atomic write with Windows file lock safety.
 - Supports one-shot execution and continuous watch daemon.
 """
@@ -380,6 +381,37 @@ def validate_masterfile_content(content: bytes) -> Tuple[bool, str, int, int]:
         return False, f"Validation error: {e}", 0, 0
 
 
+def _workbooks_have_identical_cells(existing_bytes: bytes, new_bytes: bytes) -> bool:
+    """Compare cell values across MPR Masterfile and DMB Masterfile ignoring ZIP archive timestamps."""
+    try:
+        wb1 = openpyxl.load_workbook(io.BytesIO(existing_bytes), read_only=True, data_only=True)
+        wb2 = openpyxl.load_workbook(io.BytesIO(new_bytes), read_only=True, data_only=True)
+        try:
+            if wb1.sheetnames != wb2.sheetnames:
+                return False
+            for sname in wb1.sheetnames:
+                ws1 = wb1[sname]
+                ws2 = wb2[sname]
+                rows1 = list(ws1.iter_rows(values_only=True))
+                rows2 = list(ws2.iter_rows(values_only=True))
+                if len(rows1) != len(rows2):
+                    return False
+                for r1, r2 in zip(rows1, rows2):
+                    if len(r1) != len(r2):
+                        return False
+                    for v1, v2 in zip(r1, r2):
+                        if v1 != v2:
+                            if isinstance(v1, float) and isinstance(v2, float) and abs(v1 - v2) < 1e-9:
+                                continue
+                            return False
+            return True
+        finally:
+            wb1.close()
+            wb2.close()
+    except Exception:
+        return False
+
+
 def sync_masterfile(
     func_path: Optional[Path] = None,
     strat_path: Optional[Path] = None,
@@ -394,9 +426,9 @@ def sync_masterfile(
         strat_path = strat_path or detected_strat
 
     if not func_path or not func_path.exists():
-        return {"success": False, "message": f"Functional DMB file not found: {func_path}"}
+        return {"success": False, "changed": False, "message": f"Functional DMB file not found: {func_path}"}
     if not strat_path or not strat_path.exists():
-        return {"success": False, "message": f"Strategic Execution file not found: {strat_path}"}
+        return {"success": False, "changed": False, "message": f"Strategic Execution file not found: {strat_path}"}
 
     logger.info("Reading Functional DMB Workbook: %s", func_path.name)
     logger.info("Reading Strategic Execution Workbook: %s", strat_path.name)
@@ -409,12 +441,14 @@ def sync_masterfile(
 
     # Load existing masterfile if valid template exists, otherwise create new
     out_wb = None
+    existing_master_bytes: Optional[bytes] = None
     if target_path.exists():
         try:
             m_bytes = read_file_safe_bytes(target_path)
             cand_wb = openpyxl.load_workbook(io.BytesIO(m_bytes))
             if "DMB Masterfile" in cand_wb.sheetnames and cand_wb["DMB Masterfile"].max_row >= 180:
                 out_wb = cand_wb
+                existing_master_bytes = m_bytes
         except Exception:
             pass
 
@@ -590,13 +624,36 @@ def sync_masterfile(
     is_valid, err_msg, dmb_rows, mpr_rows = validate_masterfile_content(content_bytes)
     if not is_valid:
         logger.error("Masterfile validation failed: %s", err_msg)
-        return {"success": False, "message": f"Validation failed: {err_msg}"}
+        return {"success": False, "changed": False, "message": f"Validation failed: {err_msg}"}
+
+    # Check if actual cell values changed vs existing file (ignores openpyxl internal ZIP timestamps)
+    if existing_master_bytes and _workbooks_have_identical_cells(existing_master_bytes, content_bytes):
+        try:
+            max_src_mtime = max(
+                func_path.stat().st_mtime if func_path.exists() else 0.0,
+                strat_path.stat().st_mtime if strat_path.exists() else 0.0,
+            )
+            if target_path.exists() and target_path.stat().st_mtime < max_src_mtime:
+                os.utime(target_path, None)
+        except Exception:
+            pass
+        logger.debug("Masterfile cell contents are already identical (%d DMB rows, %d MPR rows); skipping rewrite.", dmb_rows, mpr_rows)
+        return {
+            "success": True,
+            "changed": False,
+            "target": str(target_path),
+            "dmb_rows": dmb_rows,
+            "mpr_rows": mpr_rows,
+            "bytes": len(existing_master_bytes),
+            "message": f"Masterfile already up to date ({dmb_rows} DMB rows, {mpr_rows} MPR rows).",
+        }
 
     success = atomic_write_bytes(target_path, content_bytes)
     if success:
         logger.info("Successfully consolidated Masterfile (%d DMB rows, %d MPR rows, %d bytes).", dmb_rows, mpr_rows, len(content_bytes))
         return {
             "success": True,
+            "changed": True,
             "target": str(target_path),
             "dmb_rows": dmb_rows,
             "mpr_rows": mpr_rows,
@@ -604,7 +661,7 @@ def sync_masterfile(
             "message": f"Masterfile updated successfully with {dmb_rows} DMB rows and {mpr_rows} MPR rows.",
         }
     else:
-        return {"success": False, "message": "Failed to write target masterfile."}
+        return {"success": False, "changed": False, "message": "Failed to write target masterfile."}
 
 
 def watch_and_sync(interval_seconds: float = 3.0):

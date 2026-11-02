@@ -12,3 +12,7 @@ antenv/
 venv/
 .venv/
 scratch/
+.email_sync_state.json
+.poller.lock
+data/.email_sync_state.json
+data/.poller.lock

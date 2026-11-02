@@ -3,11 +3,12 @@ SharePoint Live Sync Engine for DMB Performance Dashboard
 =========================================================
 Unified synchronization engine providing real-time fetching and hot-reloading
 of DMB Excel workbooks from:
-  1. Mailbox IMAP (dmbdashboard@gmail.com - live cloud fetching for Azure)
-  2. SharePoint direct Web URLs
-  3. Local OneDrive / SharePoint synced folders (local pairing)
+  1. Mailbox IMAP (dmbdashboard30@gmail.com - live cloud fetching for Azure)
+  2. GitHub Repository Contents API (live cloud blob SHA sync)
+  3. SharePoint direct Web URLs
+  4. Local OneDrive / SharePoint synced folders (local pairing)
 
-Automatically commits and pushes updated files to GitHub repository.
+Automatically consolidates Masterfile and commits/pushes updated files to GitHub.
 """
 
 from __future__ import annotations
@@ -42,6 +43,7 @@ BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 CONFIG_PATH = BASE_DIR / "sharepoint_config.json"
+POLLER_LOCK_PATH = DATA_DIR / ".poller.lock"
 
 XLSX_MAGIC = b"PK\x03\x04"
 
@@ -58,6 +60,7 @@ def load_config() -> dict:
     default_config = {
         "sync_enabled": True,
         "poll_interval_seconds": 20,
+        "remote_poll_interval_seconds": 20,
         "sync_mode": "auto",
         "mailbox": {
             "imap_host": os.getenv("IMAP_HOST", "imap.gmail.com"),
@@ -287,25 +290,28 @@ def download_sharepoint_url(url: str, target_key: str = "", timeout: int = 20) -
 
 class SharePointSyncManager:
     """
-    Manages unified live fetching from Mailbox (dmbdashboard@gmail.com),
-    SharePoint Direct URLs, and local OneDrive sync directories.
+    Manages unified live fetching from Mailbox (dmbdashboard30@gmail.com),
+    GitHub repository live updates, SharePoint Direct URLs, and local OneDrive sync directories.
     """
 
     def __init__(self):
         self.config = load_config()
         self._lock = threading.Lock()
+        self._sync_execution_lock = threading.Lock()
         self._file_hashes: Dict[str, str] = {}
         self._last_sync_time: Optional[float] = None
+        self._last_remote_check_time: float = 0.0
         self._last_sync_status: str = "Initialized"
         self._last_sync_details: dict = {}
         self._reload_callbacks: List[Callable[[], Any]] = []
         self._worker_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
         self._local_stat_cache: Dict[str, Tuple[int, int, bool]] = {}
+        self._poller_lock_fh = None
         self._init_existing_hashes()
 
     def _init_existing_hashes(self):
-        """Record SHA-256 hashes of existing files in data/."""
+        """Record SHA-256 hashes and Git blob SHAs of existing files in data/."""
         for key, target_name in TARGET_FILENAMES.items():
             path = DATA_DIR / target_name
             if path.exists():
@@ -314,6 +320,36 @@ class SharePointSyncManager:
                     self._file_hashes[target_name] = get_file_sha256(data)
                 except Exception:
                     pass
+
+    def _acquire_poller_lock(self) -> bool:
+        """
+        Acquire an OS-level non-blocking file lock so only one Gunicorn worker
+        runs the background sync poller thread. Other workers hot-reload from disk.
+        """
+        if self._poller_lock_fh is not None:
+            return True
+        try:
+            POLLER_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+            fh = open(POLLER_LOCK_PATH, "a+b")
+            fh.seek(0)
+            if fh.tell() == 0:
+                fh.write(b"1")
+                fh.flush()
+            fh.seek(0)
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self._poller_lock_fh = fh
+            return True
+        except Exception:
+            try:
+                fh.close()  # type: ignore[name-defined]
+            except Exception:
+                pass
+            return False
 
     def register_reload_callback(self, callback: Callable[[], Any]):
         with self._lock:
@@ -353,7 +389,6 @@ class SharePointSyncManager:
         found_files: Dict[str, Path] = {}
 
         for root_dir in search_dirs:
-            is_downloads = "download" in root_dir.name.lower() or "downloads" in str(root_dir).lower()
             for key, patterns in self.config.get("file_match_patterns", {}).items():
                 if key in found_files:
                     continue
@@ -405,150 +440,176 @@ class SharePointSyncManager:
 
         return found_files
 
-    def sync_once(self) -> dict:
+    def sync_once(self, force_remote: bool = False) -> dict:
         """
-        Perform a single unified sync cycle across Mailbox, URLs, and Local Folders.
+        Perform a single unified sync cycle across Mailbox, GitHub, URLs, and Local Folders.
+        Remote network checks (IMAP & GitHub) are throttled to avoid rate-limiting unless force_remote=True.
         """
-        self.config = load_config()
-        if not self.config.get("sync_enabled", True):
-            return {
-                "updated": False,
-                "status": "Disabled",
-                "message": "SharePoint sync is disabled in configuration.",
-                "files_updated": [],
-                "timestamp": time.time(),
+        with self._sync_execution_lock:
+            self.config = load_config()
+            if not self.config.get("sync_enabled", True):
+                return {
+                    "updated": False,
+                    "status": "Disabled",
+                    "message": "SharePoint sync is disabled in configuration.",
+                    "files_updated": [],
+                    "timestamp": time.time(),
+                }
+
+            updated_files: List[str] = []
+            errors: List[str] = []
+            synced_sources: Dict[str, str] = {}
+
+            now = time.time()
+            remote_interval = max(15, int(self.config.get("remote_poll_interval_seconds", 20)))
+            should_check_remote = force_remote or ((now - self._last_remote_check_time) >= remote_interval)
+
+            if should_check_remote:
+                self._last_remote_check_time = now
+
+                # 1A. Check Mailbox Sync (dmbdashboard30@gmail.com)
+                try:
+                    mb_count, mb_files = email_sync.sync_once()
+                    if mb_count > 0:
+                        for f in mb_files:
+                            if f not in updated_files:
+                                updated_files.append(f)
+                                synced_sources[f] = "Mailbox Live Fetch (dmbdashboard30@gmail.com)"
+                                f_path = DATA_DIR / f
+                                if f_path.exists():
+                                    try:
+                                        self._file_hashes[f] = get_file_sha256(read_file_safe_bytes(f_path))
+                                    except Exception:
+                                        pass
+                except Exception as e:
+                    errors.append(f"Mailbox sync: {e}")
+
+                # 1B. Check GitHub Repository for live pushed updates (for Azure hot-reload without container restart)
+                try:
+                    gh_count, gh_files = email_sync.pull_from_github_if_updated()
+                    if gh_count > 0:
+                        for f in gh_files:
+                            if f not in updated_files:
+                                updated_files.append(f)
+                                synced_sources[f] = "GitHub Live Repository Sync"
+                                f_path = DATA_DIR / f
+                                if f_path.exists():
+                                    try:
+                                        self._file_hashes[f] = get_file_sha256(read_file_safe_bytes(f_path))
+                                    except Exception:
+                                        pass
+                except Exception as e:
+                    errors.append(f"GitHub sync: {e}")
+
+            # 2. Check SharePoint URLs & Local Synced Folder for any remaining files
+            urls = self.config.get("sharepoint_urls", {})
+            local_files = self.find_local_synced_files()
+
+            for key, target_name in TARGET_FILENAMES.items():
+                if target_name in updated_files:
+                    continue
+
+                target_path = DATA_DIR / target_name
+                url = urls.get(key, "").strip()
+                content: bytes | None = None
+                source_desc = ""
+
+                # Try direct SharePoint URL (only on remote check cadence)
+                if url and should_check_remote:
+                    try:
+                        content = download_sharepoint_url(url, target_key=key)
+                        if content:
+                            source_desc = f"SharePoint Web URL ({url[:35]}...)"
+                    except Exception as e:
+                        errors.append(f"URL error ({key}): {e}")
+
+                # Try Local Synced Folder if URL didn't provide content
+                if not content and key in local_files:
+                    local_path = local_files[key]
+                    try:
+                        # Guard: Never overwrite an existing file in data/ with an older source file
+                        if target_path.exists():
+                            if local_path.stat().st_mtime <= target_path.stat().st_mtime:
+                                continue
+                        content = read_file_safe_bytes(local_path)
+                        source_desc = f"Local Synced SharePoint ({local_path.name})"
+                    except Exception as e:
+                        errors.append(f"Local sync error ({local_path.name}): {e}")
+
+                # If content is new or changed
+                if content and content.startswith(XLSX_MAGIC):
+                    new_hash = get_file_sha256(content)
+                    old_hash = self._file_hashes.get(target_name)
+
+                    if old_hash != new_hash or not target_path.exists():
+                        success = atomic_write_bytes(target_path, content)
+                        if success:
+                            self._file_hashes[target_name] = new_hash
+                            email_sync.record_seen_blob_sha(target_name, content)
+                            updated_files.append(target_name)
+                            synced_sources[target_name] = source_desc
+                            logger.info("Successfully synced %s from %s", target_name, source_desc)
+                            # Push to GitHub repository
+                            email_sync.push_to_github_if_configured(target_name, content)
+                    else:
+                        synced_sources[target_name] = f"Up to date ({source_desc})"
+
+            # 3. Auto-Consolidate Masterfile whenever Functional Review or Strategic Execution is updated
+            func_file_name = TARGET_FILENAMES["functional_review"]
+            strat_file_name = TARGET_FILENAMES["strategic_execution"]
+            master_file_name = TARGET_FILENAMES["masterfile"]
+
+            strat_p = DATA_DIR / strat_file_name
+            func_p = DATA_DIR / func_file_name
+            master_p = DATA_DIR / master_file_name
+
+            sources_need_consolidation = (
+                func_file_name in updated_files
+                or strat_file_name in updated_files
+                or not master_p.exists()
+            )
+
+            if sources_need_consolidation:
+                try:
+                    from scripts.sync_to_masterfile import sync_masterfile
+                    sync_res = sync_masterfile(
+                        func_path=func_p if func_p.exists() else None,
+                        strat_path=strat_p if strat_p.exists() else None,
+                        target_path=master_p,
+                    )
+                    if sync_res.get("success") and sync_res.get("changed", False):
+                        if master_file_name not in updated_files:
+                            updated_files.append(master_file_name)
+                        synced_sources[master_file_name] = "Auto-Consolidated from Updated Functional/Strategic Files"
+                        if master_p.exists():
+                            master_bytes = read_file_safe_bytes(master_p)
+                            self._file_hashes[master_file_name] = get_file_sha256(master_bytes)
+                            email_sync.record_seen_blob_sha(master_file_name, master_bytes)
+                            email_sync.push_to_github_if_configured(master_file_name, master_bytes)
+                        logger.info("Auto-consolidated %s after source files updated.", master_file_name)
+                except Exception as e:
+                    errors.append(f"Auto-consolidation error: {e}")
+
+            self._last_sync_time = time.time()
+            has_updates = len(updated_files) > 0
+
+            if has_updates:
+                self._last_sync_status = "Updated"
+                self.trigger_reload_callbacks()
+            else:
+                self._last_sync_status = "Live (In Sync)"
+
+            result = {
+                "updated": has_updates,
+                "status": self._last_sync_status,
+                "files_updated": updated_files,
+                "sources": synced_sources,
+                "errors": errors,
+                "timestamp": self._last_sync_time,
+                "formatted_time": time.strftime("%I:%M:%S %p", time.localtime(self._last_sync_time)),
             }
-
-        updated_files: List[str] = []
-        errors: List[str] = []
-        synced_sources: Dict[str, str] = {}
-
-        # 1. Check Mailbox Sync (dmbdashboard@gmail.com)
-        try:
-            mb_count, mb_files = email_sync.sync_once()
-            if mb_count > 0:
-                for f in mb_files:
-                    if f not in updated_files:
-                        updated_files.append(f)
-                        synced_sources[f] = "Mailbox Live Fetch (dmbdashboard@gmail.com)"
-                        # Update recorded hash
-                        f_path = DATA_DIR / f
-                        if f_path.exists():
-                            try:
-                                self._file_hashes[f] = get_file_sha256(read_file_safe_bytes(f_path))
-                            except Exception:
-                                pass
-        except Exception as e:
-            errors.append(f"Mailbox sync: {e}")
-
-        # 2. Check SharePoint URLs & Local Synced Folder for any remaining files
-        urls = self.config.get("sharepoint_urls", {})
-        local_files = self.find_local_synced_files()
-
-        for key, target_name in TARGET_FILENAMES.items():
-            if target_name in updated_files:
-                continue
-
-            target_path = DATA_DIR / target_name
-            url = urls.get(key, "").strip()
-            content: bytes | None = None
-            source_desc = ""
-
-            # Try direct SharePoint URL
-            if url:
-                try:
-                    content = download_sharepoint_url(url, target_key=key)
-                    if content:
-                        source_desc = f"SharePoint Web URL ({url[:35]}...)"
-                except Exception as e:
-                    errors.append(f"URL error ({key}): {e}")
-
-            # Try Local Synced Folder if URL didn't provide content
-            if not content and key in local_files:
-                local_path = local_files[key]
-                try:
-                    # Guard: Never overwrite an existing file in data/ with an older source file!
-                    if target_path.exists():
-                        if local_path.stat().st_mtime < target_path.stat().st_mtime:
-                            continue
-                    content = read_file_safe_bytes(local_path)
-                    source_desc = f"Local Synced SharePoint ({local_path.name})"
-                except Exception as e:
-                    errors.append(f"Local sync error ({local_path.name}): {e}")
-
-            # If content is new or changed
-            if content and content.startswith(XLSX_MAGIC):
-                new_hash = get_file_sha256(content)
-                old_hash = self._file_hashes.get(target_name)
-
-                if old_hash != new_hash or not target_path.exists():
-                    success = atomic_write_bytes(target_path, content)
-                    if success:
-                        self._file_hashes[target_name] = new_hash
-                        updated_files.append(target_name)
-                        synced_sources[target_name] = source_desc
-                        logger.info("Successfully synced %s from %s", target_name, source_desc)
-                        # Push to GitHub repository
-                        email_sync.push_to_github_if_configured(target_name, content)
-                else:
-                    synced_sources[target_name] = f"Up to date ({source_desc})"
-
-        # 3. Auto-Consolidate Masterfile whenever Functional Review or Strategic Execution is newer
-        func_file_name = TARGET_FILENAMES["functional_review"]
-        strat_file_name = TARGET_FILENAMES["strategic_execution"]
-        master_file_name = TARGET_FILENAMES["masterfile"]
-
-        strat_p = DATA_DIR / strat_file_name
-        func_p = DATA_DIR / func_file_name
-        master_p = DATA_DIR / master_file_name
-
-        m_mtime = master_p.stat().st_mtime if master_p.exists() else 0.0
-        sources_need_consolidation = (
-            func_file_name in updated_files
-            or strat_file_name in updated_files
-            or not master_p.exists()
-        )
-
-        if sources_need_consolidation:
-            try:
-                from scripts.sync_to_masterfile import sync_masterfile
-                sync_res = sync_masterfile(
-                    func_path=func_p if func_p.exists() else None,
-                    strat_path=strat_p if strat_p.exists() else None,
-                    target_path=master_p,
-                )
-                if sync_res.get("success"):
-                    if master_file_name not in updated_files:
-                        updated_files.append(master_file_name)
-                    synced_sources[master_file_name] = "Auto-Consolidated from Updated Functional/Strategic Files"
-                    if master_p.exists():
-                        self._file_hashes[master_file_name] = get_file_sha256(read_file_safe_bytes(master_p))
-                        # Also push to GitHub if configured
-                        email_sync.push_to_github_if_configured(master_file_name, read_file_safe_bytes(master_p))
-                    logger.info("Auto-consolidated %s after source files updated.", master_file_name)
-            except Exception as e:
-                errors.append(f"Auto-consolidation error: {e}")
-
-        self._last_sync_time = time.time()
-        has_updates = len(updated_files) > 0
-
-        if has_updates:
-            self._last_sync_status = "Updated"
-            self.trigger_reload_callbacks()
-        else:
-            self._last_sync_status = "Live (In Sync)"
-
-        result = {
-            "updated": has_updates,
-            "status": self._last_sync_status,
-            "files_updated": updated_files,
-            "sources": synced_sources,
-            "errors": errors,
-            "timestamp": self._last_sync_time,
-            "formatted_time": time.strftime("%I:%M:%S %p", time.localtime(self._last_sync_time)),
-        }
-        self._last_sync_details = result
-        return result
+            self._last_sync_details = result
+            return result
 
     def get_status(self) -> dict:
         """Return current status of the sync engine for the UI."""
@@ -559,8 +620,8 @@ class SharePointSyncManager:
                 "status": self._last_sync_status,
                 "last_sync_time": self._last_sync_time,
                 "formatted_time": time.strftime("%I:%M:%S %p", time.localtime(self._last_sync_time)) if self._last_sync_time else "Never",
-                "poll_interval": self.config.get("poll_interval_seconds", 60),
-                "mailbox_user": os.getenv("IMAP_USER", "dmbdashboard@gmail.com"),
+                "poll_interval": self.config.get("poll_interval_seconds", 20),
+                "mailbox_user": os.getenv("IMAP_USER", "dmbdashboard30@gmail.com"),
                 "mailbox_configured": bool(os.getenv("IMAP_PASSWORD")),
                 "github_configured": bool(os.getenv("GITHUB_TOKEN") or os.getenv("GH_TOKEN")),
                 "local_synced_folder": self.config.get("local_synced_folder", ""),
@@ -570,22 +631,26 @@ class SharePointSyncManager:
             }
 
     def start_background_poller(self):
-        """Start the background daemon poller thread."""
+        """Start the background daemon poller thread (single-leader across multi-worker processes)."""
         if self._worker_thread and self._worker_thread.is_alive():
             return
 
+        if not self._acquire_poller_lock():
+            logger.info("Another worker process holds the sync poller lock; this worker will hot-reload from disk.")
+            return
+
         def _poller():
-            logger.info("SharePoint Live Sync background poller active.")
+            logger.info("SharePoint Live Sync background poller active (pid=%d).", os.getpid())
             try:
-                self.sync_once()
+                self.sync_once(force_remote=True)
             except Exception as e:
                 logger.error("Startup sync error: %s", e)
 
             while not self._stop_event.is_set():
-                interval = max(2, int(self.config.get("poll_interval_seconds", 3)))
+                interval = max(3, int(self.config.get("poll_interval_seconds", 20)))
                 time.sleep(interval)
                 try:
-                    self.sync_once()
+                    self.sync_once(force_remote=False)
                 except Exception as e:
                     logger.error("Background sync error: %s", e)
 
@@ -602,9 +667,9 @@ def get_sync_manager() -> SharePointSyncManager:
     return sharepoint_sync_manager
 
 
-def sync_now() -> dict:
+def sync_now(force_remote: bool = True) -> dict:
     """Convenience helper to trigger an immediate sync."""
-    return sharepoint_sync_manager.sync_once()
+    return sharepoint_sync_manager.sync_once(force_remote=force_remote)
 
 
 def start_live_sync(callback: Optional[Callable[[], Any]] = None):
@@ -619,5 +684,5 @@ if __name__ == "__main__":
     mgr = SharePointSyncManager()
     detected = mgr.find_local_synced_files()
     print(f"Detected local files: {detected}")
-    res = mgr.sync_once()
+    res = mgr.sync_once(force_remote=True)
     print(f"Sync result: {res}")

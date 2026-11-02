@@ -3,19 +3,21 @@ DMB-Dashboard — SharePoint Mailbox Live Sync & GitHub Pipeline
 ================================================================
 Monitors mailbox (e.g. dmbdashboard@gmail.com) for updated SharePoint Excel workbooks:
   1. Masterfile_DMB_Dashboard.xlsx
-  2. Functional DMB Review Sheets-.xlsx
-  3. Strategic Execution Dashboard-11th_Sept.xlsx
+  2. Functional DMB Review Sheets.xlsx
+  3. Strategic Execution Dashboard.xlsx
 
 Key Capabilities:
-- Preserves all historical emails in the mailbox while always pulling the newest data.
-- Writes incoming workbooks directly into DMB-Dashboard/data/ directory atomically.
-- Automatically commits updated Excel workbooks to GitHub (data/ folder).
-- Triggers instant hot-reload of in-memory data without server restarts.
+- Preserves all historical emails in the mailbox while only applying genuinely new updates.
+- Prevents stale historical emails from overwriting newer consolidated or synced files.
+- Writes incoming workbooks into DMB-Dashboard/data/ directory atomically.
+- Automatically commits updated Excel workbooks to GitHub (data/ folder) with retry on 409 Conflict.
+- Supports live pull from GitHub when new blob SHAs appear on main.
 """
 
 from __future__ import annotations
 
 import base64
+import ctypes
 import email
 import email.utils
 import hashlib
@@ -24,9 +26,11 @@ import io
 import json
 import logging
 import os
+import time
 from email.header import decode_header, make_header
 from pathlib import Path
-from typing import Callable, Iterator, List, Optional, Tuple
+from typing import Callable, Dict, Iterator, List, Optional, Set, Tuple
+import urllib.parse
 import urllib.request
 import urllib.error
 
@@ -40,6 +44,7 @@ if not logger.handlers:
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
+STATE_FILE = BASE_DIR / ".email_sync_state.json"
 
 XLSX_MAGIC = b"PK\x03\x04"
 
@@ -59,11 +64,149 @@ def _decode(value: str | None) -> str:
     if not value:
         return ""
     try:
-        import urllib.parse
         decoded = str(make_header(decode_header(value)))
         return urllib.parse.unquote(decoded)
     except Exception:
         return value or ""
+
+
+def compute_git_blob_sha(content: bytes) -> str:
+    """Compute the exact Git blob SHA-1 for given bytes."""
+    return hashlib.sha1(f"blob {len(content)}\0".encode() + content).hexdigest()
+
+
+def read_file_safe_bytes(file_path: Path | str) -> bytes:
+    """Read file safely on Windows even if open in Excel / OneDrive sync."""
+    file_path = Path(file_path)
+    if not file_path.exists():
+        raise FileNotFoundError(f"File not found: {file_path}")
+
+    if os.name != "nt":
+        return file_path.read_bytes()
+
+    import msvcrt
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    create_file.restype = wintypes.HANDLE
+
+    handle = create_file(
+        str(file_path),
+        0x80000000,
+        0x7,
+        None,
+        3,
+        0x80,
+        None,
+    )
+    if handle is None or handle == wintypes.HANDLE(-1).value or handle == -1:
+        return file_path.read_bytes()
+
+    try:
+        fd = msvcrt.open_osfhandle(handle, os.O_RDONLY)
+        with open(fd, "rb") as f:
+            return f.read()
+    except Exception:
+        return file_path.read_bytes()
+
+
+def atomic_write_bytes(target_path: Path, content: bytes) -> bool:
+    """Write bytes atomically to target_path using a temporary file."""
+    if not content or not content.startswith(XLSX_MAGIC):
+        logger.warning("Refusing to write non-XLSX payload to %s", target_path.name)
+        return False
+
+    temp_path = target_path.with_suffix(f".tmp.{os.getpid()}_{int(time.time()*1000)}")
+    try:
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path.write_bytes(content)
+        if target_path.exists():
+            try:
+                target_path.unlink()
+            except Exception:
+                pass
+        temp_path.replace(target_path)
+        return True
+    except Exception as e:
+        logger.error("Failed atomic write to %s: %s", target_path, e)
+        if temp_path.exists():
+            try:
+                temp_path.unlink()
+            except Exception:
+                pass
+        return False
+
+
+# Track seen Git blob SHAs and processed email keys so stale versions never overwrite newer files
+_sync_state: Dict[str, Any] = {
+    "processed_email_keys": [],
+    "last_email_ts_by_file": {},
+    "seen_blob_shas": {},
+}
+_state_initialized = False
+
+
+def _init_sync_state() -> None:
+    global _state_initialized, _sync_state
+    if _state_initialized:
+        return
+    _state_initialized = True
+
+    if STATE_FILE.exists():
+        try:
+            loaded = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                _sync_state.update(loaded)
+        except Exception:
+            pass
+
+    seen_shas = _sync_state.setdefault("seen_blob_shas", {})
+    for target_name in TARGET_FILENAMES.values():
+        p = DATA_DIR / target_name
+        sha_list = seen_shas.setdefault(target_name, [])
+        if p.exists():
+            try:
+                b_sha = compute_git_blob_sha(read_file_safe_bytes(p))
+                if b_sha not in sha_list:
+                    sha_list.append(b_sha)
+            except Exception:
+                pass
+
+
+def _save_sync_state() -> None:
+    try:
+        # Keep processed_email_keys bounded to last 300 entries
+        if len(_sync_state.get("processed_email_keys", [])) > 300:
+            _sync_state["processed_email_keys"] = _sync_state["processed_email_keys"][-300:]
+        for k, v in list(_sync_state.get("seen_blob_shas", {}).items()):
+            if len(v) > 50:
+                _sync_state["seen_blob_shas"][k] = v[-50:]
+        temp_state = STATE_FILE.with_suffix(f".tmp.{os.getpid()}")
+        temp_state.write_text(json.dumps(_sync_state, indent=2), encoding="utf-8")
+        temp_state.replace(STATE_FILE)
+    except Exception:
+        pass
+
+
+def record_seen_blob_sha(filename: str, content: bytes) -> str:
+    """Record a file's Git blob SHA as known/seen by this node."""
+    _init_sync_state()
+    b_sha = compute_git_blob_sha(content)
+    sha_list = _sync_state.setdefault("seen_blob_shas", {}).setdefault(filename, [])
+    if b_sha not in sha_list:
+        sha_list.append(b_sha)
+        _save_sync_state()
+    return b_sha
 
 
 def standardize_workbook_filename(raw_filename: str, payload: bytes | None = None) -> str:
@@ -143,7 +286,6 @@ def get_configured_github_repo() -> str:
     if repo:
         return repo
 
-    # Try reading from local git remote
     try:
         import subprocess
         out = subprocess.check_output(
@@ -153,7 +295,6 @@ def get_configured_github_repo() -> str:
             stderr=subprocess.DEVNULL,
         ).strip()
         if "github.com" in out:
-            # parse git@github.com:user/repo.git or https://github.com/user/repo.git
             clean = out.split("github.com", 1)[1].lstrip(":").lstrip("/")
             if clean.endswith(".git"):
                 clean = clean[:-4]
@@ -164,84 +305,189 @@ def get_configured_github_repo() -> str:
     return "pratibha131/DMB-Dashboard"
 
 
+def _get_github_token() -> str:
+    token = _env("GITHUB_TOKEN") or _env("GH_TOKEN")
+    if token:
+        return token
+    env_file = BASE_DIR / ".env"
+    if env_file.exists():
+        try:
+            for line in env_file.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                if k.strip() in ("GITHUB_TOKEN", "GH_TOKEN") and v.strip():
+                    return v.strip().strip('"').strip("'")
+        except Exception:
+            pass
+    return ""
+
+
 def push_to_github_if_configured(filename: str, content: bytes) -> bool:
     """
     If GITHUB_TOKEN (or GH_TOKEN) is configured, automatically commits
     the updated Excel file directly to the GitHub repository main branch.
+    Uses [skip ci] to prevent unnecessary Azure container rebuild loops,
+    and retries on HTTP 409 Conflict.
     """
-    token = _env("GITHUB_TOKEN") or _env("GH_TOKEN")
+    token = _get_github_token()
     repo = get_configured_github_repo()
+    record_seen_blob_sha(filename, content)
+
     if not token:
         logger.debug("GITHUB_TOKEN not configured; skipping automatic GitHub commit.")
         return False
+
     # If pushing masterfile, ensure it is complete and valid
     if "masterfile" in filename.lower():
         try:
             from scripts.sync_to_masterfile import validate_masterfile_content
-            is_valid, err_msg, dmb_r, mpr_r = validate_masterfile_content(content)
+            is_valid, err_msg, _, _ = validate_masterfile_content(content)
             if not is_valid:
                 logger.warning("Refusing to push invalid/truncated Masterfile to GitHub: %s", err_msg)
                 return False
         except Exception as e:
             logger.warning("Masterfile pre-push validation notice: %s", e)
 
-    try:
-        path = f"data/{filename}"
-        quoted_path = urllib.parse.quote(path)
-        api_url = f"https://api.github.com/repos/{repo}/contents/{quoted_path}"
+    path = f"data/{filename}"
+    quoted_path = urllib.parse.quote(path)
+    api_url = f"https://api.github.com/repos/{repo}/contents/{quoted_path}"
+    blob_sha = compute_git_blob_sha(content)
 
-        # Get existing file SHA if it exists
-        sha = None
-        req = urllib.request.Request(
-            api_url,
-            headers={
-                "Authorization": f"token {token}",
-                "Accept": "application/vnd.github.v3+json",
-                "User-Agent": "DMB-Dashboard-Sync",
-            },
-        )
+    for attempt in range(1, 4):
         try:
-            with urllib.request.urlopen(req, timeout=12) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                sha = data.get("sha")
-        except urllib.error.HTTPError as e:
-            if e.code != 404:
-                logger.warning("GitHub API check returned HTTP %d for %s: %s", e.code, path, e)
-        except Exception as e:
-            logger.debug("GitHub SHA check notice: %s", e)
+            sha = None
+            req = urllib.request.Request(
+                api_url,
+                headers={
+                    "Authorization": f"token {token}",
+                    "Accept": "application/vnd.github.v3+json",
+                    "User-Agent": "DMB-Dashboard-Sync",
+                },
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=12) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                    sha = data.get("sha")
+            except urllib.error.HTTPError as e:
+                if e.code != 404:
+                    logger.warning("GitHub API check returned HTTP %d for %s: %s", e.code, path, e)
+            except Exception as e:
+                logger.debug("GitHub SHA check notice: %s", e)
 
-        # Check if identical content is already on GitHub to prevent redundant commits
-        blob_sha = hashlib.sha1(f"blob {len(content)}\0".encode() + content).hexdigest()
-        if sha and sha == blob_sha:
-            logger.debug("File data/%s is already identical on GitHub (SHA %s); skipping redundant commit.", filename, sha[:7])
-            return True
+            if sha:
+                sha_list = _sync_state.setdefault("seen_blob_shas", {}).setdefault(filename, [])
+                if sha not in sha_list:
+                    sha_list.append(sha)
 
-        payload = {
-            "message": f"Auto-sync {filename} from SharePoint via live sync",
-            "content": base64.b64encode(content).decode("ascii"),
-            "branch": "main",
-        }
-        if sha:
-            payload["sha"] = sha
-
-        put_req = urllib.request.Request(
-            api_url,
-            data=json.dumps(payload).encode("utf-8"),
-            headers={
-                "Authorization": f"token {token}",
-                "Accept": "application/vnd.github.v3+json",
-                "Content-Type": "application/json",
-                "User-Agent": "DMB-Dashboard-Sync",
-            },
-            method="PUT",
-        )
-        with urllib.request.urlopen(put_req, timeout=20) as resp:
-            if resp.status in (200, 201):
-                logger.info("Successfully committed & pushed data/%s to GitHub repo (%s)", filename, repo)
+            # Check if identical content is already on GitHub to prevent redundant commits
+            if sha and sha == blob_sha:
+                logger.debug("File data/%s is already identical on GitHub (SHA %s); skipping redundant commit.", filename, sha[:7])
                 return True
-    except Exception as e:
-        logger.warning("Could not auto-commit data/%s to GitHub (%s): %s", filename, repo, e)
+
+            payload = {
+                "message": f"Auto-sync {filename} from SharePoint via live sync [skip ci]",
+                "content": base64.b64encode(content).decode("ascii"),
+                "branch": "main",
+            }
+            if sha:
+                payload["sha"] = sha
+
+            put_req = urllib.request.Request(
+                api_url,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={
+                    "Authorization": f"token {token}",
+                    "Accept": "application/vnd.github.v3+json",
+                    "Content-Type": "application/json",
+                    "User-Agent": "DMB-Dashboard-Sync",
+                },
+                method="PUT",
+            )
+            with urllib.request.urlopen(put_req, timeout=25) as resp:
+                if resp.status in (200, 201):
+                    logger.info("Successfully committed & pushed data/%s to GitHub repo (%s)", filename, repo)
+                    _save_sync_state()
+                    return True
+        except urllib.error.HTTPError as e:
+            if e.code in (409, 422, 500, 502, 503, 504) and attempt < 3:
+                time.sleep(0.8 * attempt)
+                continue
+            logger.warning("Could not auto-commit data/%s to GitHub (%s): HTTP %d %s", filename, repo, e.code, e)
+            break
+        except Exception as e:
+            if attempt < 3:
+                time.sleep(0.8 * attempt)
+                continue
+            logger.warning("Could not auto-commit data/%s to GitHub (%s): %s", filename, repo, e)
+            break
     return False
+
+
+def pull_from_github_if_updated() -> List[str]:
+    """
+    Checks if any canonical workbook on GitHub main branch has a brand-new blob SHA
+    that this instance has not seen yet. If so, downloads it atomically into data/.
+    This ensures Azure hot-reloads files pushed from laptop OneDrive without server restarts.
+    """
+    _init_sync_state()
+    token = _get_github_token()
+    repo = get_configured_github_repo()
+    updated_files: List[str] = []
+
+    headers = {
+        "Accept": "application/vnd.github.v3+json",
+        "User-Agent": "DMB-Dashboard-Sync",
+    }
+    if token:
+        headers["Authorization"] = f"token {token}"
+
+    for key, filename in TARGET_FILENAMES.items():
+        target_path = DATA_DIR / filename
+        local_sha = ""
+        if target_path.exists():
+            try:
+                local_bytes = read_file_safe_bytes(target_path)
+                local_sha = record_seen_blob_sha(filename, local_bytes)
+            except Exception:
+                pass
+
+        quoted_path = urllib.parse.quote(f"data/{filename}")
+        api_url = f"https://api.github.com/repos/{repo}/contents/{quoted_path}?ref=main"
+        try:
+            req = urllib.request.Request(api_url, headers=headers)
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                meta = json.loads(resp.read().decode("utf-8"))
+                remote_sha = meta.get("sha", "")
+                if not remote_sha or remote_sha == local_sha:
+                    continue
+
+                seen_shas = _sync_state.setdefault("seen_blob_shas", {}).setdefault(filename, [])
+                if remote_sha in seen_shas:
+                    # Remote has an older SHA that we already superseded locally
+                    continue
+
+                # Brand-new SHA on GitHub -> fetch content
+                content_b64 = meta.get("content", "")
+                dl_url = meta.get("download_url", "")
+                raw_bytes: Optional[bytes] = None
+                if content_b64:
+                    raw_bytes = base64.b64decode(content_b64)
+                elif dl_url:
+                    dl_req = urllib.request.Request(dl_url, headers={"User-Agent": "DMB-Dashboard-Sync"})
+                    with urllib.request.urlopen(dl_req, timeout=15) as dl_resp:
+                        raw_bytes = dl_resp.read()
+
+                if raw_bytes and raw_bytes.startswith(XLSX_MAGIC):
+                    if atomic_write_bytes(target_path, raw_bytes):
+                        record_seen_blob_sha(filename, raw_bytes)
+                        updated_files.append(filename)
+                        logger.info("Hot-pulled updated data/%s from GitHub (SHA %s)", filename, remote_sha[:7])
+        except Exception as e:
+            logger.debug("GitHub poll check notice for %s: %s", filename, e)
+
+    return updated_files
 
 
 def load_mailbox_config() -> dict:
@@ -302,15 +548,28 @@ def load_mailbox_config() -> dict:
     return cfg
 
 
+def _parse_email_timestamp(date_str: str | None) -> float:
+    if not date_str:
+        return 0.0
+    try:
+        dt = email.utils.parsedate_to_datetime(date_str)
+        if dt is not None:
+            return dt.timestamp()
+    except Exception:
+        pass
+    return 0.0
+
+
 def sync_once(resolve_target: Callable[[str], Path] | None = None) -> Tuple[int, List[str]]:
     """
-    Polls the mailbox over IMAP SSL and updates data/ workbooks directly.
-    Scans from NEWEST to OLDEST so newest updates take precedence while retaining
-    all historical emails in the mailbox.
+    Polls the mailbox over IMAP SSL and updates data/ workbooks atomically.
+    Scans from NEWEST to OLDEST and tracks processed email keys & timestamps
+    so old historical emails never overwrite newer files on disk.
 
     Returns:
         (updated_count, list_of_updated_filenames)
     """
+    _init_sync_state()
     cfg = load_mailbox_config()
     host = cfg["host"]
     user = cfg["user"]
@@ -325,10 +584,13 @@ def sync_once(resolve_target: Callable[[str], Path] | None = None) -> Tuple[int,
     if not allowed:
         allowed = {"*"}
 
-    marker = _env("SYNC_SUBJECT_MARKER", "DMB")
     updated_files: List[str] = []
-    found_targets = set()
+    found_targets: Set[str] = set()
     needed_workbooks = set(TARGET_FILENAMES.values())
+    all_targets_exist_on_disk = all((DATA_DIR / name).exists() for name in needed_workbooks)
+
+    processed_keys: List[str] = _sync_state.setdefault("processed_email_keys", [])
+    last_ts_by_file: Dict[str, float] = _sync_state.setdefault("last_email_ts_by_file", {})
 
     try:
         port = cfg["port"]
@@ -337,12 +599,10 @@ def sync_once(resolve_target: Callable[[str], Path] | None = None) -> Tuple[int,
             imap.login(user, clean_password)
             imap.select(cfg["folder"])
 
-
-
             seen_ids = set()
             ordered_ids = []
 
-            # Fast targeted search by subjects first, fallback to recent
+            # Search UNSEEN first, then targeted subject query
             search_queries = [
                 '(OR (OR SUBJECT "SharePoint" SUBJECT "DMB") (OR SUBJECT "Strategic" SUBJECT "Functional"))',
                 'UNSEEN',
@@ -364,29 +624,41 @@ def sync_once(resolve_target: Callable[[str], Path] | None = None) -> Tuple[int,
             if not ordered_ids:
                 return 0, []
 
-            # Sort message IDs numerically (higher ID = newer email)
             ordered_ids.sort(key=lambda x: int(x) if x.isdigit() else 0)
-
-            # Process only the most recent relevant emails (up to 15 emails instead of 150)
             recent_ids = list(reversed(ordered_ids))[:15]
 
             for num in recent_ids:
                 try:
-                    # Quick header check first
-                    status, h_data = imap.fetch(num, "(BODY.PEEK[HEADER.FIELDS (FROM SUBJECT)])")
-                    if status == "OK" and h_data and h_data[0] and isinstance(h_data[0], tuple):
-                        h_msg = email.message_from_bytes(h_data[0][1])
-                        sender = email.utils.parseaddr(h_msg.get("From", ""))[1].lower()
-                        subj = _decode(h_msg.get("Subject", "")).lower()
-                        
-                        # Check sender allowed
-                        if "*" not in allowed:
-                            is_allowed = any(
-                                (item.startswith("@") and sender.endswith(item)) or (sender == item)
-                                for item in allowed
-                            )
-                            if not is_allowed:
-                                continue
+                    status, h_data = imap.fetch(
+                        num, "(FLAGS BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE MESSAGE-ID)])"
+                    )
+                    if status != "OK" or not h_data or not h_data[0] or not isinstance(h_data[0], tuple):
+                        continue
+
+                    meta_line = h_data[0][0].decode("utf-8", errors="ignore")
+                    is_unseen = "\\Seen" not in meta_line
+                    h_msg = email.message_from_bytes(h_data[0][1])
+                    sender = email.utils.parseaddr(h_msg.get("From", ""))[1].lower()
+                    subj = _decode(h_msg.get("Subject", "")).strip()
+                    date_hdr = h_msg.get("Date", "")
+                    msg_id_hdr = (h_msg.get("Message-ID") or "").strip()
+                    email_ts = _parse_email_timestamp(date_hdr)
+
+                    msg_unique_key = msg_id_hdr or f"{sender}|{subj}|{date_hdr}"
+
+                    # Sender filter
+                    if "*" not in allowed:
+                        is_allowed = any(
+                            (item.startswith("@") and sender.endswith(item)) or (sender == item)
+                            for item in allowed
+                        )
+                        if not is_allowed:
+                            continue
+
+                    # Fast skip: if this email was already processed and all 3 workbooks exist on disk,
+                    # do not re-download the full RFC822 attachment or overwrite newer files.
+                    if all_targets_exist_on_disk and not is_unseen and msg_unique_key in processed_keys:
+                        continue
 
                     status, raw = imap.fetch(num, "(RFC822)")
                 except Exception:
@@ -396,62 +668,88 @@ def sync_once(resolve_target: Callable[[str], Path] | None = None) -> Tuple[int,
                     continue
 
                 msg = email.message_from_bytes(raw[0][1])
-                sender = email.utils.parseaddr(msg.get("From", ""))[1].lower()
-
-                # Sender validation
-                is_allowed = False
-                if "*" in allowed:
-                    is_allowed = True
-                else:
-                    for allow_item in allowed:
-                        if allow_item.startswith("@") and sender.endswith(allow_item):
-                            is_allowed = True
-                            break
-                        elif sender == allow_item:
-                            is_allowed = True
-                            break
-
-                if not is_allowed:
-                    continue
+                if not email_ts:
+                    email_ts = _parse_email_timestamp(msg.get("Date", ""))
 
                 file_found_in_msg = False
                 for filename, payload in _excel_attachments(msg):
-                    if resolve_target:
-                        target = resolve_target(filename)
-                    else:
-                        target = DATA_DIR / filename
-
+                    target = resolve_target(filename) if resolve_target else (DATA_DIR / filename)
                     target_name = target.name
                     target.parent.mkdir(parents=True, exist_ok=True)
 
-                    # Only update if this file has not yet been processed in this pass
-                    if target_name not in found_targets:
-                        found_targets.add(target_name)
-                        is_new = True
-                        if target.exists():
-                            try:
-                                if target.read_bytes() == payload:
-                                    is_new = False
-                            except Exception:
-                                pass
-                        if is_new:
-                            target.write_bytes(payload)
+                    if target_name in found_targets:
+                        continue
+
+                    found_targets.add(target_name)
+                    file_found_in_msg = True
+
+                    # Stale email guard: never overwrite a newer file on disk with an older historical email
+                    prev_email_ts = float(last_ts_by_file.get(target_name, 0.0))
+                    if target.exists() and not is_unseen:
+                        if prev_email_ts > 0 and email_ts > 0 and email_ts < prev_email_ts:
+                            logger.debug("Skipping older email attachment for %s (email_ts < prev_email_ts)", target_name)
+                            continue
+                        try:
+                            disk_mtime = target.stat().st_mtime
+                            # If email is older than the file on disk by > 2 minutes and was already seen, skip overwrite
+                            if email_ts > 0 and email_ts < (disk_mtime - 120):
+                                logger.debug("Skipping historical seen email for %s (older than local disk file)", target_name)
+                                continue
+                        except Exception:
+                            pass
+
+                    # Extra guard for Masterfile: never let an old Masterfile email overwrite a newer Functional/Strategic consolidation
+                    if target_name == TARGET_FILENAMES["masterfile"] and target.exists():
+                        try:
+                            func_p = DATA_DIR / TARGET_FILENAMES["functional_review"]
+                            strat_p = DATA_DIR / TARGET_FILENAMES["strategic_execution"]
+                            newest_source_mtime = max(
+                                func_p.stat().st_mtime if func_p.exists() else 0.0,
+                                strat_p.stat().st_mtime if strat_p.exists() else 0.0,
+                            )
+                            if email_ts > 0 and newest_source_mtime > (email_ts + 60):
+                                logger.debug("Skipping older Masterfile email attachment because source review sheets are newer.")
+                                continue
+                        except Exception:
+                            pass
+
+                    is_new = True
+                    if target.exists():
+                        try:
+                            existing_bytes = read_file_safe_bytes(target)
+                            if existing_bytes == payload:
+                                is_new = False
+                            elif compute_git_blob_sha(payload) in _sync_state.get("seen_blob_shas", {}).get(target_name, []):
+                                # We have already seen this exact attachment blob in the past; do not revert to it!
+                                is_new = False
+                        except Exception:
+                            pass
+
+                    if is_new:
+                        if atomic_write_bytes(target, payload):
+                            record_seen_blob_sha(target_name, payload)
+                            if email_ts > 0:
+                                last_ts_by_file[target_name] = max(prev_email_ts, email_ts)
                             updated_files.append(target_name)
                             logger.info(
                                 "Updated data/%s from mailbox (%d bytes)", target_name, len(payload)
                             )
                             push_to_github_if_configured(target_name, payload)
-                        file_found_in_msg = True
+                    else:
+                        if email_ts > 0 and email_ts > prev_email_ts:
+                            last_ts_by_file[target_name] = email_ts
 
-                if file_found_in_msg:
+                if msg_unique_key and msg_unique_key not in processed_keys:
+                    processed_keys.append(msg_unique_key)
+                    _save_sync_state()
+
+                if file_found_in_msg and is_unseen:
                     try:
                         imap.store(num, "+FLAGS", "\\Seen")
                     except Exception:
                         pass
 
-                # If all 3 target workbooks are found, stop early
                 if needed_workbooks.issubset(found_targets):
-                    logger.info("All 3 DMB workbooks retrieved from mailbox.")
                     break
 
     except Exception as exc:
