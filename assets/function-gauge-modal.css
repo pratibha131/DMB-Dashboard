@@ -450,26 +450,26 @@
     width: 100%;
     border-collapse: separate;
     border-spacing: 0;
-    font-size: 13.5px;
+    font-size: 15.5px;
 }
 
 /* Header Row */
 .fn-trend-th {
     background: #074a75;
     color: #ffffff;
-    font-weight: 750;
-    font-size: 12.5px;
+    font-weight: 800;
+    font-size: 14px;
     text-transform: uppercase;
     letter-spacing: 0.5px;
-    padding: 8px 10px;
+    padding: 10px 10px;
     text-align: center;
     border-right: 1px solid rgba(255, 255, 255, 0.15);
     white-space: nowrap;
 }
 
 .fn-trend-th-metric {
-    width: 125px;
-    min-width: 125px;
+    width: 135px;
+    min-width: 135px;
     text-align: left;
     padding-left: 18px;
     background: #053b5f;
@@ -477,7 +477,7 @@
 }
 
 .fn-trend-th-month {
-    min-width: 62px;
+    min-width: 66px;
 }
 
 .fn-trend-th-selected {
@@ -488,9 +488,9 @@
 
 /* Type Label Cells */
 .fn-trend-td-type {
-    padding: 8px 16px;
+    padding: 10px 16px;
     font-weight: 800;
-    font-size: 12.5px;
+    font-size: 13.5px;
     text-align: left;
     white-space: nowrap;
 }
@@ -508,9 +508,9 @@
 
 .fn-row-type-badge {
     display: inline-block;
-    padding: 2px 8px;
-    border-radius: 4px;
-    font-size: 12px;
+    padding: 4px 10px;
+    border-radius: 5px;
+    font-size: 13.5px;
     font-weight: 800;
     letter-spacing: 0.3px;
     text-transform: uppercase;
@@ -523,17 +523,17 @@
 
 .fn-badge-actual {
     background: #e2e8f0;
-    color: #334155;
+    color: #1e293b;
 }
 
 /* Target Data Cells (Excel Blue Format) */
 .fn-trend-tgt-cell {
     background: #f0f9ff;
-    color: #0284c7;
-    font-weight: 750;
-    font-size: 13.5px;
+    color: #026aa7;
+    font-weight: 800;
+    font-size: 15.5px;
     text-align: center;
-    padding: 8px 6px;
+    padding: 10px 8px;
     border-bottom: 1px solid #d8e6f1;
     border-right: 1px solid #e0f0fa;
     white-space: nowrap;
@@ -541,10 +541,10 @@
 
 /* Actual Data Cells (Red/Green Status Format) */
 .fn-trend-act-cell {
-    font-weight: 750;
-    font-size: 13.5px;
+    font-weight: 800;
+    font-size: 15.5px;
     text-align: center;
-    padding: 8px 6px;
+    padding: 10px 8px;
     white-space: nowrap;
 }
 
@@ -562,7 +562,7 @@
 
 .fn-act-nodata {
     background: #f8fafc;
-    color: #94a3b8;
+    color: #64748b;
     border-right: 1px solid #f1f5f9;
 }
 
@@ -570,6 +570,7 @@
 .fn-cell-selected-month {
     border-left: 2px solid #38bdf8 !important;
     border-right: 2px solid #38bdf8 !important;
+    font-size: 16px !important;
     font-weight: 850 !important;
 }
 

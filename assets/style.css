@@ -530,7 +530,7 @@ textarea {
     color: var(--text-dark) !important;
 }
 
-/* Dash 4 dropdown classes (including Radix UI body portal). */
+/* Dash 4 dropdown classes (including body-portaled dropdown menus). */
 .dash-dropdown-content,
 .dash-dropdown-options,
 .section-month-dropdown .dash-dropdown-content,
@@ -542,6 +542,8 @@ textarea {
 .dash-dropdown-option,
 .dash-dropdown-option *,
 .month-option-label,
+[role="listbox"] [role="option"],
+[role="listbox"] [role="option"] *,
 .section-month-dropdown .dash-dropdown-option,
 .section-month-dropdown .dash-dropdown-option *,
 .section-month-dropdown .month-option-label {
@@ -553,16 +555,12 @@ textarea {
     font-weight: 600 !important;
 }
 
-.dash-dropdown-option,
 .section-month-dropdown .dash-dropdown-option {
     min-height: 40px !important;
     padding: 10px 12px !important;
     background: #ffffff !important;
 }
 
-.dash-dropdown-option:hover,
-.dash-dropdown-option[aria-selected="true"],
-.dash-dropdown-option[data-selected="true"],
 .section-month-dropdown .dash-dropdown-option:hover,
 .section-month-dropdown .dash-dropdown-option[aria-selected="true"],
 .section-month-dropdown .dash-dropdown-option[data-selected="true"] {
