@@ -561,8 +561,12 @@ textarea {
     color: #063b65 !important;
 }
 
+.section-month-dropdown,
+.section-month-dropdown *,
 .section-month-dropdown .dash-dropdown-value,
-.section-month-dropdown .dash-dropdown-value * {
+.section-month-dropdown .dash-dropdown-value *,
+.section-month-dropdown .Select-value-label,
+.section-month-dropdown .Select__single-value {
     color: #142638 !important;
     -webkit-text-fill-color: #142638 !important;
     opacity: 1 !important;
