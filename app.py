@@ -1305,7 +1305,14 @@ def get_available_months(data):
 def create_month_options(months):
     return [
         {
-            "label": pd.Timestamp(month).strftime("%B %Y"),
+            "label": html.Span(
+                pd.Timestamp(month).strftime("%B %Y"),
+                className="month-option-label",
+                style={
+                    "color": "#142638",
+                    "fontWeight": 600,
+                },
+            ),
             "value": pd.Timestamp(month).strftime("%Y-%m-%d"),
         }
         for month in months
