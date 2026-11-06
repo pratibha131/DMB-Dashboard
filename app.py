@@ -1,6 +1,9 @@
 import os
 import json
 import time
+import math
+import html as html_lib
+import urllib.parse
 from pathlib import Path
 from datetime import date, datetime
 from io import BytesIO
@@ -1196,18 +1199,23 @@ def data_folder_signature():
     return res
 
 
-def get_function_rca_data():
+def get_function_rca_data(force_reload=False):
     """
     Return the Functional DMB Review data, re-reading the workbook when a data
     file changes or when the previous read failed (for example because the
     workbook was open in Excel), so no app restart is needed.
     """
+    cached_data = _function_rca_cache["data"]
+    if not force_reload and cached_data is not None and not cached_data.get("error"):
+        return cached_data
+
     signature = data_folder_signature()
 
     with _function_rca_lock:
         cached_data = _function_rca_cache["data"]
         if (
-            cached_data is None
+            force_reload
+            or cached_data is None
             or cached_data["error"]
             or _function_rca_cache["signature"] != signature
         ):
@@ -1741,6 +1749,63 @@ def create_mini_gauge(value):
     return figure
 
 
+def create_mini_gauge_svg_uri(value):
+    is_no_data = value is None or pd.isna(value)
+    numeric_value = 0.0 if is_no_data else float(value)
+    clamped = max(0.0, min(100.0, numeric_value))
+    gauge_color = "#dce7ef" if is_no_data else ("#168b69" if numeric_value >= GAUGE_TARGET else "#dc3d56")
+
+    cx, cy, r = 115.0, 108.0, 68.0
+    x_start, y_start = cx - r, cy
+    x_full, y_full = cx + r, cy
+
+    active_arc = ""
+    if not is_no_data and clamped > 0.05:
+        if clamped >= 99.95:
+            x_end, y_end = x_full, y_full
+        else:
+            ang = math.radians(180.0 - (clamped / 100.0) * 180.0)
+            x_end = cx + r * math.cos(ang)
+            y_end = cy - r * math.sin(ang)
+        active_arc = (
+            f'<path d="M {x_start:.2f} {y_start:.2f} A {r:.2f} {r:.2f} 0 0 1 {x_end:.2f} {y_end:.2f}" '
+            f'fill="none" stroke="{gauge_color}" stroke-width="22" stroke-linecap="butt"/>'
+        )
+
+    t_ang = math.radians(180.0 - (GAUGE_TARGET / 100.0) * 180.0)
+    tx1 = cx + 54.0 * math.cos(t_ang)
+    ty1 = cy - 54.0 * math.sin(t_ang)
+    tx2 = cx + 82.0 * math.cos(t_ang)
+    ty2 = cy - 82.0 * math.sin(t_ang)
+
+    tk1_x = cx + 80.5 * math.cos(t_ang)
+    tk1_y = cy - 80.5 * math.sin(t_ang)
+    tk2_x = cx + 84.5 * math.cos(t_ang)
+    tk2_y = cy - 84.5 * math.sin(t_ang)
+    lbl_x = cx + 87.0 * math.cos(t_ang)
+    lbl_y = cy - 87.0 * math.sin(t_ang) + 3.0
+
+    val_text = "—" if is_no_data else format_percentage(value)
+
+    svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 230 132" width="100%" height="140">'
+        f'<path d="M {x_start:.2f} {y_start:.2f} A {r:.2f} {r:.2f} 0 0 1 {x_full:.2f} {y_full:.2f}" '
+        'fill="none" stroke="#dce7ef" stroke-width="22" stroke-linecap="butt"/>'
+        f'{active_arc}'
+        f'<line x1="{tx1:.2f}" y1="{ty1:.2f}" x2="{tx2:.2f}" y2="{ty2:.2f}" stroke="#0877b9" stroke-width="3"/>'
+        f'<line x1="36" y1="{cy:.0f}" x2="32" y2="{cy:.0f}" stroke="#000000" stroke-width="1"/>'
+        f'<text x="30" y="{cy + 3:.0f}" text-anchor="end" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#000000">0%</text>'
+        f'<line x1="194" y1="{cy:.0f}" x2="198" y2="{cy:.0f}" stroke="#000000" stroke-width="1"/>'
+        f'<text x="200" y="{cy + 3:.0f}" text-anchor="start" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#000000">100%</text>'
+        f'<line x1="{tk1_x:.2f}" y1="{tk1_y:.2f}" x2="{tk2_x:.2f}" y2="{tk2_y:.2f}" stroke="#000000" stroke-width="1"/>'
+        f'<text x="{lbl_x:.2f}" y="{lbl_y:.2f}" text-anchor="start" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#000000">{GAUGE_TARGET}%</text>'
+        f'<text x="{cx:.0f}" y="89" text-anchor="middle" font-family="Segoe UI, Arial, sans-serif" font-size="26" font-weight="700" fill="#000000">{val_text}</text>'
+        f'<text x="{cx:.0f}" y="110" text-anchor="middle" font-family="Segoe UI, Arial, sans-serif" font-size="11" fill="#000000">met &amp; improved</text>'
+        '</svg>'
+    )
+    return "data:image/svg+xml;utf8," + urllib.parse.quote(svg)
+
+
 # RCA Table rendering is defined after create_cause_table below.
 
 
@@ -1870,10 +1935,10 @@ def create_function_card(function_name, current_data):
                                     ],
                                     className="mini-gauge-title",
                                 ),
-                                dcc.Graph(
-                                    figure=create_mini_gauge(None),
-                                    config={"displayModeBar": False, "staticPlot": True},
+                                html.Img(
+                                    src=create_mini_gauge_svg_uri(None),
                                     className="mini-gauge-graph",
+                                    alt=f"{function_name} Met & improved gauge",
                                 ),
                             ],
                             id={
@@ -1970,10 +2035,10 @@ def create_function_card(function_name, current_data):
                                 ],
                                 className="mini-gauge-title",
                             ),
-                            dcc.Graph(
-                                figure=create_mini_gauge(performance),
-                                config={"displayModeBar": False, "staticPlot": True},
+                            html.Img(
+                                src=create_mini_gauge_svg_uri(performance),
                                 className="mini-gauge-graph",
+                                alt=f"{function_name} Met & improved gauge",
                             ),
                         ],
                         id={
@@ -4536,16 +4601,34 @@ def create_function_kpis_table_detail(function_name, selected_month):
         except (ValueError, TypeError):
             return str(val)
 
-    # 2. Build Individual KPI Cards with 2-Row Monthly Trend Tables
+    # 2. Build Individual KPI Cards with 2-Row Monthly Trend Tables (O(1) dict lookup instead of repeated DataFrame slicing)
+    kpi_hist_by_name = {k: [] for k in kpi_names}
+    kpi_month_map = {k: {} for k in kpi_names}
+    for rec in fn_rows.sort_values("month").to_dict("records"):
+        kn = rec.get("kpi_name")
+        if kn in kpi_hist_by_name:
+            kpi_hist_by_name[kn].append(rec)
+            m_val = rec.get("month")
+            if pd.notna(m_val):
+                kpi_month_map[kn][m_val] = rec
+
+    def _first_valid(recs, col):
+        for r in recs:
+            v = r.get(col)
+            if v is not None and pd.notna(v) and str(v).strip() != "":
+                return v
+        return ""
+
     kpi_cards = []
     for idx, k_name in enumerate(kpi_names, 1):
-        k_hist = fn_rows[fn_rows["kpi_name"] == k_name].sort_values("month")
-        def_val = k_hist["definition"].dropna().iloc[0] if not k_hist["definition"].dropna().empty else ""
-        unit_val = k_hist["units"].dropna().iloc[0] if not k_hist["units"].dropna().empty else ""
-        op_val = k_hist["operator"].dropna().iloc[0] if not k_hist["operator"].dropna().empty else ""
-        aop_val = k_hist["target_aop_2026"].dropna().iloc[0] if not k_hist["target_aop_2026"].dropna().empty else ""
-        nature_val = k_hist["metric_nature"].dropna().iloc[0] if not k_hist["metric_nature"].dropna().empty else ""
-        dt_val = k_hist["data_type"].dropna().iloc[0] if "data_type" in k_hist.columns and not k_hist["data_type"].dropna().empty else ""
+        k_recs = kpi_hist_by_name.get(k_name, [])
+        k_by_m = kpi_month_map.get(k_name, {})
+        def_val = _first_valid(k_recs, "definition")
+        unit_val = _first_valid(k_recs, "units")
+        op_val = _first_valid(k_recs, "operator")
+        aop_val = _first_valid(k_recs, "target_aop_2026")
+        nature_val = _first_valid(k_recs, "metric_nature")
+        dt_val = _first_valid(k_recs, "data_type")
 
         unit_clean = str(unit_val).strip()
         dt_clean = str(dt_val).strip().lower()
@@ -4578,8 +4661,8 @@ def create_function_kpis_table_detail(function_name, selected_month):
         target_aop_display = f"{op_val} {aop_fmt}".strip() if op_val else aop_fmt
         nature_display = f"{effective_unit} · {nature_val}".strip(" ·") if effective_unit or nature_val else ""
 
-        curr_record = k_hist[k_hist["month"] == selected_month]
-        st_curr = curr_record["status"].iloc[0] if not curr_record.empty else "No Data"
+        curr_record = k_by_m.get(selected_month)
+        st_curr = curr_record.get("status", "No Data") if curr_record is not None else "No Data"
 
         if st_curr == "Met":
             status_pill = html.Span("🟢 Met", className="fn-badge-met")
@@ -4654,8 +4737,8 @@ def create_function_kpis_table_detail(function_name, selected_month):
             ),
         ]
         for m in all_months:
-            m_rec = k_hist[k_hist["month"] == m]
-            m_tgt = m_rec["Target"].iloc[0] if not m_rec.empty else None
+            m_rec = k_by_m.get(m)
+            m_tgt = m_rec.get("Target") if m_rec is not None else None
             t_str = format_val_str(m_tgt, effective_unit, is_pct, dt_clean)
             is_cur = (m == selected_month)
             td_cls = "fn-trend-td fn-trend-tgt-cell" + (" fn-cell-selected-month" if is_cur else "")
@@ -4671,9 +4754,9 @@ def create_function_kpis_table_detail(function_name, selected_month):
             ),
         ]
         for m in all_months:
-            m_rec = k_hist[k_hist["month"] == m]
-            m_act = m_rec["Actual"].iloc[0] if not m_rec.empty else None
-            m_st = m_rec["status"].iloc[0] if not m_rec.empty else "No Data"
+            m_rec = k_by_m.get(m)
+            m_act = m_rec.get("Actual") if m_rec is not None else None
+            m_st = m_rec.get("status", "No Data") if m_rec is not None else "No Data"
             a_str = format_val_str(m_act, effective_unit, is_pct, dt_clean)
             is_cur = (m == selected_month)
 
@@ -4765,24 +4848,98 @@ def get_function_kpis_trend_modal_content(function_name, month_value, active_kpi
     return create_function_kpis_table_detail(function_name, selected_month)
 
 
+_VOID_HTML_TAGS = {
+    "area", "base", "br", "col", "embed", "hr", "img", "input",
+    "link", "meta", "param", "source", "track", "wbr",
+}
+_ATTR_NAME_MAP = {
+    "className": "class",
+    "htmlFor": "for",
+    "colSpan": "colspan",
+    "rowSpan": "rowspan",
+    "tabIndex": "tabindex",
+    "readOnly": "readonly",
+    "maxLength": "maxlength",
+    "minLength": "minlength",
+    "cellPadding": "cellpadding",
+    "cellSpacing": "cellspacing",
+}
+_IGNORED_DASH_PROPS = {"n_clicks", "n_clicks_timestamp", "key", "loading_state", "disable_n_clicks"}
+
+
+def render_dash_to_html(node):
+    if node is None or node is False or node is True:
+        return ""
+    if isinstance(node, (str, int, float)):
+        return html_lib.escape(str(node))
+    if isinstance(node, (list, tuple)):
+        return "".join(render_dash_to_html(child) for child in node)
+    if isinstance(node, dict):
+        tag = str(node.get("type", "div")).lower()
+        props = node.get("props", {}) or {}
+    elif hasattr(node, "_type"):
+        tag = str(getattr(node, "_type", "div")).lower()
+        pj = node.to_plotly_json()
+        props = pj.get("props", {}) if isinstance(pj, dict) else {}
+    else:
+        return html_lib.escape(str(node))
+
+    attr_parts = []
+    children = None
+    for k, v in props.items():
+        if k == "children":
+            children = v
+            continue
+        if k in _IGNORED_DASH_PROPS or v is None or v is False:
+            continue
+        if k == "disabled":
+            if v:
+                attr_parts.append("disabled")
+            continue
+        if k == "id" and isinstance(v, dict):
+            v_str = json.dumps(v, separators=(",", ":"))
+            attr_parts.append(f'id="{html_lib.escape(v_str, quote=True)}"')
+            continue
+        if k == "style" and isinstance(v, dict):
+            style_items = []
+            for sk, sv in v.items():
+                if sv is not None and sv != "":
+                    css_k = re.sub(r"([A-Z])", lambda m: "-" + m.group(1).lower(), str(sk))
+                    style_items.append(f"{css_k}:{sv}")
+            if style_items:
+                attr_parts.append(f'style="{html_lib.escape(";".join(style_items), quote=True)}"')
+            continue
+        attr_name = _ATTR_NAME_MAP.get(k, k)
+        attr_parts.append(f'{attr_name}="{html_lib.escape(str(v), quote=True)}"')
+
+    attr_str = (" " + " ".join(attr_parts)) if attr_parts else ""
+    if tag in _VOID_HTML_TAGS:
+        return f"<{tag}{attr_str}/>"
+    inner_html = render_dash_to_html(children)
+    return f"<{tag}{attr_str}>{inner_html}</{tag}>"
+
+
 @memoize_by_data_signature
-def get_dmb_gauge_preloaded_views(month_value):
-    panels = []
+def get_dmb_modals_preloaded_payload(month_value):
+    rca_map = {}
+    gauge_map = {}
     for fn in FUNCTION_ORDER:
+        _, c_title, c_month, c_body = get_continuous_red_modal_content(fn, month_value)
+        rca_map[fn] = {
+            "title": c_title,
+            "month": c_month,
+            "html": render_dash_to_html(c_body),
+        }
         g_body = get_function_kpis_trend_modal_content(fn, month_value)
-        slug_fn = re.sub(r"[^a-z0-9]+", "-", fn.lower()).strip("-")
-        panels.append(
-            html.Div(
-                g_body,
-                id=f"gauge-preloaded-panel-{slug_fn}",
-                className="gauge-preloaded-panel",
-                **{
-                    "data-gauge-function": fn,
-                    "data-gauge-title": f"{fn} — Function KPI Performance Review",
-                },
-            )
-        )
-    return panels
+        gauge_map[fn] = {
+            "title": f"{fn} — Function KPI Performance Review",
+            "html": render_dash_to_html(g_body),
+        }
+    return {
+        "month": month_value,
+        "rca": rca_map,
+        "gauge": gauge_map,
+    }
 
 
 def create_mpr_breakdown_pills(summary, active_filter="all"):
@@ -4927,8 +5084,7 @@ def warmup_cache():
             m_str = def_m.strftime("%Y-%m-%d")
             get_mpr_dashboard_content(m_str)
             get_dmb_function_cards_content(m_str)
-            get_dmb_rca_preloaded_views(m_str)
-            get_dmb_gauge_preloaded_views(m_str)
+            get_dmb_modals_preloaded_payload(m_str)
             get_rca_table_content(m_str)
 
         # 2. Warm up all months in memory with zero sleep delay for instant month switching
@@ -4937,8 +5093,7 @@ def warmup_cache():
             m_str = m.strftime("%Y-%m-%d")
             get_mpr_dashboard_content(m_str)
             get_dmb_function_cards_content(m_str)
-            get_dmb_rca_preloaded_views(m_str)
-            get_dmb_gauge_preloaded_views(m_str)
+            get_dmb_modals_preloaded_payload(m_str)
             get_rca_table_content(m_str)
     except Exception as e:
         print(f"[Cache Warmup Notice] {e}")
@@ -4964,8 +5119,7 @@ def serve_layout():
 
     mpr_init = get_mpr_dashboard_content(mpr_str)
     dmb_init_cards = get_dmb_function_cards_content(dmb_str)
-    dmb_init_rca_views = get_dmb_rca_preloaded_views(dmb_str)
-    dmb_init_gauge_views = get_dmb_gauge_preloaded_views(dmb_str)
+    dmb_init_modals_payload = get_dmb_modals_preloaded_payload(dmb_str)
     rca_init_table, rca_init_month = get_rca_table_content(mpr_str)
 
     return html.Div(
@@ -4997,6 +5151,8 @@ def serve_layout():
                 className="top-navigation",
             ),
             dcc.Store(id="one-pager-download-state"),
+            dcc.Store(id="dmb-modals-preloaded-store", storage_type="memory", data=dmb_init_modals_payload),
+            dcc.Store(id="dmb-modals-sync-dummy", storage_type="memory"),
             dcc.Store(id="active-rca-modal-state", storage_type="memory", data={"is_open": False, "function": None, "month": None}),
             dcc.Store(id="active-gauge-modal-state", storage_type="memory", data={"is_open": False, "function": None, "selected_kpi": None, "month": None}),
             dcc.Store(id="active-mpr-breakdown-modal-state", storage_type="memory", data={"is_open": False, "filter": "outside", "month": None}),
@@ -5311,7 +5467,6 @@ def serve_layout():
                                 className="continuous-red-modal-header",
                             ),
                             html.Div(
-                                dmb_init_rca_views,
                                 id="continuous-red-modal-body",
                                 className="continuous-red-modal-body",
                             ),
@@ -5376,7 +5531,6 @@ def serve_layout():
                                 className="function-gauge-modal-header",
                             ),
                             html.Div(
-                                dmb_init_gauge_views,
                                 id="function-gauge-modal-body",
                                 className="function-gauge-modal-body",
                             ),
@@ -5566,13 +5720,29 @@ def update_mpr_and_rca_combined(mpr_val, sync_data=None):
 
 
 # =========================================================
-# DMB FUNCTION-CARD CALLBACK (Function-wise Performance & Preloaded RCA/Gauge Views)
+# DMB FUNCTION-CARD CALLBACK (Function-wise Performance & Preloaded RCA/Gauge HTML Store)
 # =========================================================
+
+app.clientside_callback(
+    """
+    function(payload) {
+        if (payload) {
+            window.__dmbModalsPreloaded = payload;
+            if (typeof window.__dmbSyncOpenModalsFromStore === 'function') {
+                window.__dmbSyncOpenModalsFromStore();
+            }
+        }
+        return window.dash_clientside.no_update;
+    }
+    """,
+    Output("dmb-modals-sync-dummy", "data"),
+    Input("dmb-modals-preloaded-store", "data"),
+)
+
 
 @app.callback(
     Output("function-cards-container", "children"),
-    Output("continuous-red-modal-body", "children"),
-    Output("function-gauge-modal-body", "children"),
+    Output("dmb-modals-preloaded-store", "data"),
     Input("dmb-month-filter", "value"),
     Input("live-sync-state-store", "data"),
     prevent_initial_call=True,
@@ -5581,8 +5751,7 @@ def update_dmb_function_cards(dmb_val, sync_data=None, extra=None):
     month_value = dmb_val or default_month.strftime("%Y-%m-%d")
     return (
         get_dmb_function_cards_content(month_value),
-        get_dmb_rca_preloaded_views(month_value),
-        get_dmb_gauge_preloaded_views(month_value),
+        get_dmb_modals_preloaded_payload(month_value),
     )
 
 
@@ -5840,7 +6009,7 @@ def manage_function_gauge_modal(
     Input({"type": "mpr-modal-pill", "filter": ALL}, "n_clicks"),
     Input("close-mpr-breakdown-modal", "n_clicks"),
     Input("mpr-breakdown-modal-backdrop", "n_clicks"),
-    Input("mpr-month-filter", "value"),
+    State("mpr-month-filter", "value"),
     Input("live-sync-state-store", "data"),
     State("active-mpr-breakdown-modal-state", "data"),
     prevent_initial_call=True,
@@ -6066,6 +6235,7 @@ def _on_live_sync_reload():
     data_loader.reload_all_data(force=True)
     _sig_ttl_cache["ts"] = 0.0
     _sig_ttl_cache["sig"] = None
+    get_function_rca_data(force_reload=True)
     threading.Thread(target=warmup_cache, daemon=True).start()
 
 

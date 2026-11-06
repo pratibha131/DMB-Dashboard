@@ -89,6 +89,36 @@
 
         if (!rcaModal || !rcaBody) return false;
 
+        var preloaded = window.__dmbModalsPreloaded;
+        if (preloaded && preloaded.rca && preloaded.rca[functionName]) {
+            var entry = preloaded.rca[functionName];
+            var pTitle = entry.title || (functionName + ' — Root Cause Analysis');
+            var pMonth = entry.month || '';
+            var renderKey = (preloaded.month || '') + '::' + functionName;
+
+            if (rcaBody.getAttribute('data-rendered-key') !== renderKey) {
+                rcaBody.innerHTML = entry.html || '';
+                rcaBody.setAttribute('data-rendered-key', renderKey);
+            }
+            if (rcaTitle && rcaTitle.textContent !== pTitle) {
+                rcaTitle.textContent = pTitle;
+            }
+            if (rcaMonth && rcaMonth.textContent !== pMonth) {
+                rcaMonth.textContent = pMonth;
+            }
+
+            window.__activeRcaFunction = functionName;
+
+            if (rcaModal.classList.contains('continuous-red-modal-hidden')) {
+                rcaModal.classList.remove('continuous-red-modal-hidden');
+            }
+            if (resetScroll) {
+                rcaBody.scrollTop = 0;
+            }
+            syncModalScrollLock();
+            return true;
+        }
+
         var panels = rcaBody.querySelectorAll('.rca-preloaded-panel');
         if (!panels || panels.length === 0) return false;
 
@@ -145,6 +175,35 @@
         var gaugeBody = document.getElementById('function-gauge-modal-body');
 
         if (!gaugeModal || !gaugeBody) return false;
+
+        var preloaded = window.__dmbModalsPreloaded;
+        if (preloaded && preloaded.gauge && preloaded.gauge[functionName]) {
+            var entry = preloaded.gauge[functionName];
+            var pTitle = entry.title || (functionName + ' — Function KPI Performance Review');
+            var renderKey = (preloaded.month || '') + '::' + functionName;
+
+            if (gaugeBody.getAttribute('data-rendered-key') !== renderKey) {
+                gaugeBody.innerHTML = entry.html || '';
+                gaugeBody.setAttribute('data-rendered-key', renderKey);
+            }
+            if (gaugeTitle && gaugeTitle.textContent !== pTitle) {
+                gaugeTitle.textContent = pTitle;
+            }
+            if (gaugeSubtitle && gaugeSubtitle.textContent !== '') {
+                gaugeSubtitle.textContent = '';
+            }
+
+            window.__activeGaugeFunction = functionName;
+
+            if (gaugeModal.classList.contains('function-gauge-modal-hidden')) {
+                gaugeModal.classList.remove('function-gauge-modal-hidden');
+            }
+            if (resetScroll) {
+                gaugeBody.scrollTop = 0;
+            }
+            syncModalScrollLock();
+            return true;
+        }
 
         var panels = gaugeBody.querySelectorAll('.gauge-preloaded-panel');
         if (!panels || panels.length === 0) return false;
@@ -273,6 +332,7 @@
             window.requestAnimationFrame(syncAfterDomUpdate);
         }
     }
+    window.__dmbSyncOpenModalsFromStore = scheduleSync;
 
     // ----------------------------------------------------
     // 1. Micro-slip Tolerant Pointer Tracking on Cards
