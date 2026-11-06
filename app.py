@@ -2213,50 +2213,38 @@ def parse_num_and_unit(val):
         return None, ""
 
 
+_metric_nature_cache = {"sig": None, "map": {}}
+
+
 def get_kpi_metric_nature(kpi_name, default="Higher the better"):
     if not kpi_name:
         return default
-    k_norm = function_key(str(kpi_name))
+    sig = get_sync_signature_token()
+    if _metric_nature_cache["sig"] != sig or not _metric_nature_cache["map"]:
+        lmap = {}
+        try:
+            rca_data = get_function_rca_data()
+            review_kpis = rca_data.get("review_kpis", pd.DataFrame())
+        except Exception:
+            review_kpis = pd.DataFrame()
+        for df in (review_kpis, get_active_mpr_data(), get_active_dmb_data()):
+            if df is not None and not df.empty and "kpi_name" in df.columns and "metric_nature" in df.columns:
+                sub = df[["kpi_name", "metric_nature"]].dropna().drop_duplicates("kpi_name")
+                for r in sub.to_dict("records"):
+                    kn = str(r["kpi_name"]).strip()
+                    mn = str(r["metric_nature"]).strip()
+                    if kn and mn:
+                        lmap[kn.lower()] = mn
+                        lmap[function_key(kn)] = mn
+        _metric_nature_cache["sig"] = sig
+        _metric_nature_cache["map"] = lmap
+
+    lmap = _metric_nature_cache["map"]
     k_clean = str(kpi_name).strip().lower()
-
-    # 1. Look in DMB data
-    try:
-        active_dmb = get_active_dmb_data()
-        if not active_dmb.empty and "kpi_name" in active_dmb.columns and "metric_nature" in active_dmb.columns:
-            m = active_dmb[active_dmb["kpi_name"].apply(lambda x: function_key(str(x)) == k_norm or str(x).strip().lower() == k_clean)]
-            if not m.empty:
-                val = m["metric_nature"].dropna()
-                if not val.empty and str(val.iloc[0]).strip():
-                    return str(val.iloc[0]).strip()
-    except Exception:
-        pass
-
-    # 2. Look in MPR data
-    try:
-        active_mpr = get_active_mpr_data()
-        if not active_mpr.empty and "kpi_name" in active_mpr.columns and "metric_nature" in active_mpr.columns:
-            m = active_mpr[active_mpr["kpi_name"].apply(lambda x: function_key(str(x)) == k_norm or str(x).strip().lower() == k_clean)]
-            if not m.empty:
-                val = m["metric_nature"].dropna()
-                if not val.empty and str(val.iloc[0]).strip():
-                    return str(val.iloc[0]).strip()
-    except Exception:
-        pass
-
-    # 3. Look in review_kpis
-    try:
-        rca_data = get_function_rca_data()
-        review_kpis = rca_data.get("review_kpis", pd.DataFrame())
-        if not review_kpis.empty and "kpi_name" in review_kpis.columns and "metric_nature" in review_kpis.columns:
-            m = review_kpis[review_kpis["kpi_name"].apply(lambda x: function_key(str(x)) == k_norm or str(x).strip().lower() == k_clean)]
-            if not m.empty:
-                val = m["metric_nature"].dropna()
-                if not val.empty and str(val.iloc[0]).strip():
-                    return str(val.iloc[0]).strip()
-    except Exception:
-        pass
-
-    return default
+    if k_clean in lmap:
+        return lmap[k_clean]
+    k_norm = function_key(str(kpi_name))
+    return lmap.get(k_norm, default)
 
 
 def compute_kpi_delta_badge(
@@ -4879,8 +4867,7 @@ def render_dash_to_html(node):
         props = node.get("props", {}) or {}
     elif hasattr(node, "_type"):
         tag = str(getattr(node, "_type", "div")).lower()
-        pj = node.to_plotly_json()
-        props = pj.get("props", {}) if isinstance(pj, dict) else {}
+        props = {k: v for k, v in node.__dict__.items() if not k.startswith("_")}
     else:
         return html_lib.escape(str(node))
 
@@ -4921,6 +4908,8 @@ def render_dash_to_html(node):
 
 @memoize_by_data_signature
 def get_dmb_modals_preloaded_payload(month_value):
+    cards_list = get_dmb_function_cards_content(month_value)
+    cards_html = render_dash_to_html(cards_list)
     rca_map = {}
     gauge_map = {}
     for fn in FUNCTION_ORDER:
@@ -4937,9 +4926,25 @@ def get_dmb_modals_preloaded_payload(month_value):
         }
     return {
         "month": month_value,
+        "cards_html": cards_html,
         "rca": rca_map,
         "gauge": gauge_map,
     }
+
+
+@memoize_by_data_signature
+def get_all_months_dmb_preloaded_payload():
+    active_mpr = get_active_mpr_data()
+    active_dmb = get_active_dmb_data()
+    active_strat = get_active_rca_actions()
+    mpr_months, _ = get_dynamic_reporting_months(active_mpr, active_strat)
+    dmb_months, _ = get_dynamic_reporting_months(active_dmb, active_strat)
+    all_months = sorted(set(mpr_months + dmb_months))
+    by_month = {}
+    for m in all_months:
+        m_str = m.strftime("%Y-%m-%d")
+        by_month[m_str] = get_dmb_modals_preloaded_payload(m_str)
+    return by_month
 
 
 def create_mpr_breakdown_pills(summary, active_filter="all"):
@@ -5095,6 +5100,7 @@ def warmup_cache():
             get_dmb_function_cards_content(m_str)
             get_dmb_modals_preloaded_payload(m_str)
             get_rca_table_content(m_str)
+        get_all_months_dmb_preloaded_payload()
     except Exception as e:
         print(f"[Cache Warmup Notice] {e}")
 
@@ -5119,7 +5125,7 @@ def serve_layout():
 
     mpr_init = get_mpr_dashboard_content(mpr_str)
     dmb_init_cards = get_dmb_function_cards_content(dmb_str)
-    dmb_init_modals_payload = get_dmb_modals_preloaded_payload(dmb_str)
+    dmb_init_modals_payload = get_all_months_dmb_preloaded_payload()
     rca_init_table, rca_init_month = get_rca_table_content(mpr_str)
 
     return html.Div(
@@ -5651,17 +5657,23 @@ app.clientside_callback(
     function(mprVal, dmbVal) {
         var nu = window.dash_clientside.no_update;
         var ctx = window.dash_clientside.callback_context;
-        if (!ctx || !ctx.triggered || ctx.triggered.length === 0) {
-            return [nu, nu];
+        var selMonth = dmbVal || mprVal;
+        var outMpr = nu;
+        var outDmb = nu;
+        if (ctx && ctx.triggered && ctx.triggered.length > 0) {
+            var trig = ctx.triggered[0].prop_id.split('.')[0];
+            if (trig === 'mpr-month-filter' && mprVal) {
+                selMonth = mprVal;
+                if (mprVal !== dmbVal) outDmb = mprVal;
+            } else if (trig === 'dmb-month-filter' && dmbVal) {
+                selMonth = dmbVal;
+                if (dmbVal !== mprVal) outMpr = dmbVal;
+            }
         }
-        var trig = ctx.triggered[0].prop_id.split('.')[0];
-        if (trig === 'mpr-month-filter' && mprVal && mprVal !== dmbVal) {
-            return [nu, mprVal];
+        if (selMonth && typeof window.__dmbApplyMonthInstant === 'function') {
+            window.__dmbApplyMonthInstant(selMonth);
         }
-        if (trig === 'dmb-month-filter' && dmbVal && dmbVal !== mprVal) {
-            return [dmbVal, nu];
-        }
-        return [nu, nu];
+        return [outMpr, outDmb];
     }
     """,
     Output("mpr-month-filter", "value"),
@@ -5720,14 +5732,23 @@ def update_mpr_and_rca_combined(mpr_val, sync_data=None):
 
 
 # =========================================================
-# DMB FUNCTION-CARD CALLBACK (Function-wise Performance & Preloaded RCA/Gauge HTML Store)
+# DMB FUNCTION-CARD CALLBACK (0ms Client-Side Month Switch via Pre-Rendered HTML Store)
 # =========================================================
 
 app.clientside_callback(
     """
-    function(payload) {
+    function(payload, dmbVal) {
         if (payload) {
-            window.__dmbModalsPreloaded = payload;
+            window.__dmbAllMonthsStore = payload;
+            var activeM = dmbVal || window.__dmbCurrentMonth;
+            if (activeM && payload[activeM]) {
+                window.__dmbModalsPreloaded = payload[activeM];
+                if (typeof window.__dmbApplyMonthInstant === 'function') {
+                    window.__dmbApplyMonthInstant(activeM);
+                }
+            } else if (payload.rca && payload.gauge) {
+                window.__dmbModalsPreloaded = payload;
+            }
             if (typeof window.__dmbSyncOpenModalsFromStore === 'function') {
                 window.__dmbSyncOpenModalsFromStore();
             }
@@ -5737,16 +5758,19 @@ app.clientside_callback(
     """,
     Output("dmb-modals-sync-dummy", "data"),
     Input("dmb-modals-preloaded-store", "data"),
+    State("dmb-month-filter", "value"),
 )
 
 
 @app.callback(
-    Output("function-cards-container", "children"),
     Output("dmb-modals-preloaded-store", "data"),
-    Input("dmb-month-filter", "value"),
     Input("live-sync-state-store", "data"),
     prevent_initial_call=True,
 )
+def refresh_dmb_preloaded_store(sync_data=None):
+    return get_all_months_dmb_preloaded_payload()
+
+
 def update_dmb_function_cards(dmb_val, sync_data=None, extra=None):
     month_value = dmb_val or default_month.strftime("%Y-%m-%d")
     return (

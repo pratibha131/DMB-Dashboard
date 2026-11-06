@@ -334,6 +334,22 @@
     }
     window.__dmbSyncOpenModalsFromStore = scheduleSync;
 
+    window.__dmbApplyMonthInstant = function (monthStr) {
+        if (!monthStr) return;
+        window.__dmbCurrentMonth = monthStr;
+        var allStore = window.__dmbAllMonthsStore;
+        var monthData = (allStore && allStore[monthStr]) ? allStore[monthStr] : null;
+        if (monthData) {
+            window.__dmbModalsPreloaded = monthData;
+            var cardsContainer = document.getElementById('function-cards-container');
+            if (cardsContainer && monthData.cards_html && cardsContainer.getAttribute('data-rendered-month') !== monthStr) {
+                cardsContainer.innerHTML = monthData.cards_html;
+                cardsContainer.setAttribute('data-rendered-month', monthStr);
+            }
+            scheduleSync();
+        }
+    };
+
     // ----------------------------------------------------
     // 1. Micro-slip Tolerant Pointer Tracking on Cards
     // ----------------------------------------------------
