@@ -250,7 +250,15 @@
 }
 
 .mini-gauge-container {
+    width: 100%;
     padding: 9px 8px 2px;
+    border: 0;
+    color: inherit;
+    font-family: "Segoe UI", Arial, sans-serif;
+    text-align: left;
+    outline: none;
+    user-select: none;
+    -webkit-tap-highlight-color: transparent;
 }
 
 .mini-gauge-title {

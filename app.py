@@ -1872,7 +1872,7 @@ def create_function_card(function_name, current_data):
                                 ),
                                 dcc.Graph(
                                     figure=create_mini_gauge(None),
-                                    config={"displayModeBar": False},
+                                    config={"displayModeBar": False, "staticPlot": True},
                                     className="mini-gauge-graph",
                                 ),
                             ],
@@ -1881,6 +1881,7 @@ def create_function_card(function_name, current_data):
                                 "function": function_name,
                             },
                             n_clicks=0,
+                            type="button",
                             className="mini-gauge-container mini-gauge-container-clickable",
                             title=f"Click to view {function_name} KPI definitions and trends",
                             **{"data-gauge-open-function": function_name},
@@ -1971,7 +1972,7 @@ def create_function_card(function_name, current_data):
                             ),
                             dcc.Graph(
                                 figure=create_mini_gauge(performance),
-                                config={"displayModeBar": False},
+                                config={"displayModeBar": False, "staticPlot": True},
                                 className="mini-gauge-graph",
                             ),
                         ],
@@ -1980,6 +1981,7 @@ def create_function_card(function_name, current_data):
                             "function": function_name,
                         },
                         n_clicks=0,
+                        type="button",
                         className="mini-gauge-container mini-gauge-container-clickable",
                         title=f"Click to view {function_name} KPI definitions and 6-month trends",
                         **{"data-gauge-open-function": function_name},
@@ -4763,6 +4765,26 @@ def get_function_kpis_trend_modal_content(function_name, month_value, active_kpi
     return create_function_kpis_table_detail(function_name, selected_month)
 
 
+@memoize_by_data_signature
+def get_dmb_gauge_preloaded_views(month_value):
+    panels = []
+    for fn in FUNCTION_ORDER:
+        g_body = get_function_kpis_trend_modal_content(fn, month_value)
+        slug_fn = re.sub(r"[^a-z0-9]+", "-", fn.lower()).strip("-")
+        panels.append(
+            html.Div(
+                g_body,
+                id=f"gauge-preloaded-panel-{slug_fn}",
+                className="gauge-preloaded-panel",
+                **{
+                    "data-gauge-function": fn,
+                    "data-gauge-title": f"{fn} — Function KPI Performance Review",
+                },
+            )
+        )
+    return panels
+
+
 def create_mpr_breakdown_pills(summary, active_filter="all"):
     pills_config = [
         ("all", "All Critical KPIs", summary.get("total_kpis", 0), "pill-all"),
@@ -4906,9 +4928,8 @@ def warmup_cache():
             get_mpr_dashboard_content(m_str)
             get_dmb_function_cards_content(m_str)
             get_dmb_rca_preloaded_views(m_str)
+            get_dmb_gauge_preloaded_views(m_str)
             get_rca_table_content(m_str)
-            for fn in FUNCTION_ORDER:
-                get_function_kpis_trend_modal_content(fn, m_str)
 
         # 2. Warm up all months in memory with zero sleep delay for instant month switching
         all_months = sorted(set(mpr_months + dmb_months))
@@ -4917,9 +4938,8 @@ def warmup_cache():
             get_mpr_dashboard_content(m_str)
             get_dmb_function_cards_content(m_str)
             get_dmb_rca_preloaded_views(m_str)
+            get_dmb_gauge_preloaded_views(m_str)
             get_rca_table_content(m_str)
-            for fn in FUNCTION_ORDER:
-                get_function_kpis_trend_modal_content(fn, m_str)
     except Exception as e:
         print(f"[Cache Warmup Notice] {e}")
 
@@ -4945,6 +4965,7 @@ def serve_layout():
     mpr_init = get_mpr_dashboard_content(mpr_str)
     dmb_init_cards = get_dmb_function_cards_content(dmb_str)
     dmb_init_rca_views = get_dmb_rca_preloaded_views(dmb_str)
+    dmb_init_gauge_views = get_dmb_gauge_preloaded_views(dmb_str)
     rca_init_table, rca_init_month = get_rca_table_content(mpr_str)
 
     return html.Div(
@@ -5355,6 +5376,7 @@ def serve_layout():
                                 className="function-gauge-modal-header",
                             ),
                             html.Div(
+                                dmb_init_gauge_views,
                                 id="function-gauge-modal-body",
                                 className="function-gauge-modal-body",
                             ),
@@ -5544,12 +5566,13 @@ def update_mpr_and_rca_combined(mpr_val, sync_data=None):
 
 
 # =========================================================
-# DMB FUNCTION-CARD CALLBACK (Function-wise Performance & Preloaded RCA Views)
+# DMB FUNCTION-CARD CALLBACK (Function-wise Performance & Preloaded RCA/Gauge Views)
 # =========================================================
 
 @app.callback(
     Output("function-cards-container", "children"),
     Output("continuous-red-modal-body", "children"),
+    Output("function-gauge-modal-body", "children"),
     Input("dmb-month-filter", "value"),
     Input("live-sync-state-store", "data"),
     prevent_initial_call=True,
@@ -5559,6 +5582,7 @@ def update_dmb_function_cards(dmb_val, sync_data=None, extra=None):
     return (
         get_dmb_function_cards_content(month_value),
         get_dmb_rca_preloaded_views(month_value),
+        get_dmb_gauge_preloaded_views(month_value),
     )
 
 
@@ -5680,23 +5704,9 @@ def manage_continuous_red_modal(
 
 
 # =========================================================
-# FUNCTION GAUGE KPI DEFINITIONS & TREND MODAL CALLBACK
+# FUNCTION GAUGE KPI DEFINITIONS & TREND MODAL HELPER (Preloaded Client-Side Instant Modal)
 # =========================================================
 
-@app.callback(
-    Output("function-gauge-modal", "className"),
-    Output("function-gauge-modal-title", "children"),
-    Output("function-gauge-modal-subtitle", "children"),
-    Output("function-gauge-modal-body", "children"),
-    Output("active-gauge-modal-state", "data"),
-    Input({"type": "function-gauge-card", "function": ALL}, "n_clicks"),
-    Input("close-function-gauge-modal", "n_clicks"),
-    Input("function-gauge-modal-backdrop", "n_clicks"),
-    State("dmb-month-filter", "value"),
-    Input("live-sync-state-store", "data"),
-    State("active-gauge-modal-state", "data"),
-    prevent_initial_call=True,
-)
 def manage_function_gauge_modal(
     gauge_card_clicks,
     close_clicks,

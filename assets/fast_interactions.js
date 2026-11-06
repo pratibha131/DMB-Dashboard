@@ -256,6 +256,14 @@
                 window.__activeRcaFunction = null;
             }
         }
+        if (window.__activeGaugeFunction) {
+            var gaugeModal = document.getElementById('function-gauge-modal');
+            if (gaugeModal && !gaugeModal.classList.contains('function-gauge-modal-hidden')) {
+                activateGaugePanelDom(window.__activeGaugeFunction, false);
+            } else {
+                window.__activeGaugeFunction = null;
+            }
+        }
         syncModalScrollLock();
     }
 
@@ -286,6 +294,21 @@
                 return;
             }
         }
+        var gaugeCard = e.target && e.target.closest ? e.target.closest('.mini-gauge-container-clickable') : null;
+        if (gaugeCard && !gaugeCard.disabled) {
+            var gFn = extractGaugeFunction(gaugeCard);
+            if (gFn) {
+                pointerDownInfo = {
+                    type: 'gauge',
+                    fn: gFn,
+                    card: gaugeCard,
+                    x: e.clientX,
+                    y: e.clientY,
+                    ts: Date.now()
+                };
+                return;
+            }
+        }
         pointerDownInfo = null;
     }, true);
 
@@ -299,10 +322,11 @@
         var dx = Math.abs(e.clientX - info.x);
         var dy = Math.abs(e.clientY - info.y);
 
-        if (info.type === 'rca') {
-            var upRcaCard = e.target && e.target.closest ? e.target.closest('.continuous-red-panel-active') : null;
-            if (!upRcaCard && dt < 450 && dx < 24 && dy < 24) {
+        if (dt < 500 && dx < 30 && dy < 30) {
+            if (info.type === 'rca') {
                 openRcaModal(info.fn, info.card);
+            } else if (info.type === 'gauge') {
+                openGaugeModal(info.fn, info.card);
             }
         }
     }, true);
@@ -334,20 +358,23 @@
             return;
         }
 
-        // C. Instant Visual Feedback on Function Gauge Cards (Dash callback opens modal)
+        // C. Open Function Gauge Modal instantly from Preloaded DOM
         var gaugeCard = target.closest('.mini-gauge-container-clickable');
         if (gaugeCard && !gaugeCard.disabled) {
-            gaugeCard.classList.add('card-clicking');
-            setTimeout(function () {
-                gaugeCard.classList.remove('card-clicking');
-            }, 220);
-            return;
+            var gFn = extractGaugeFunction(gaugeCard);
+            if (gFn && openGaugeModal(gFn, gaugeCard)) {
+                e.preventDefault();
+                e.stopPropagation();
+                return;
+            }
         }
 
-        // D. Close Function Gauge Modal instantly (Back button or Backdrop) while letting Dash sync state
+        // D. Close Function Gauge Modal instantly (Back button or Backdrop)
         var gaugeClose = target.closest('#close-function-gauge-modal, #function-gauge-modal-backdrop');
         if (gaugeClose) {
             closeGaugeModal();
+            e.preventDefault();
+            e.stopPropagation();
             return;
         }
 
@@ -439,12 +466,7 @@
 
             var gaugeModal = document.getElementById('function-gauge-modal');
             if (gaugeModal && !gaugeModal.classList.contains('function-gauge-modal-hidden')) {
-                var gaugeCloseBtn = document.getElementById('close-function-gauge-modal');
-                if (gaugeCloseBtn) {
-                    gaugeCloseBtn.click();
-                } else {
-                    closeGaugeModal();
-                }
+                closeGaugeModal();
                 return;
             }
 
@@ -484,9 +506,10 @@
         var rcaModal = document.getElementById('continuous-red-modal');
         var rcaBody = document.getElementById('continuous-red-modal-body');
         var gaugeModal = document.getElementById('function-gauge-modal');
+        var gaugeBody = document.getElementById('function-gauge-modal-body');
         var mprModal = document.getElementById('mpr-breakdown-modal');
 
-        if (!rcaModal || !rcaBody || !gaugeModal || !mprModal) {
+        if (!rcaModal || !rcaBody || !gaugeModal || !gaugeBody || !mprModal) {
             setTimeout(attachModalObservers, 150);
             return;
         }
@@ -498,8 +521,9 @@
         modalAttrObserver.observe(gaugeModal, { attributes: true, attributeFilter: ['class'] });
         modalAttrObserver.observe(mprModal, { attributes: true, attributeFilter: ['class'] });
 
-        var rcaBodyObserver = new MutationObserver(scheduleSync);
-        rcaBodyObserver.observe(rcaBody, { childList: true });
+        var bodyObserver = new MutationObserver(scheduleSync);
+        bodyObserver.observe(rcaBody, { childList: true });
+        bodyObserver.observe(gaugeBody, { childList: true });
     }
 
     if (document.readyState === 'loading') {

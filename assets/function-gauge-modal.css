@@ -3,26 +3,43 @@
    ========================================================= */
 
 .mini-gauge-container-clickable {
+    position: relative;
+    width: 100%;
     cursor: pointer !important;
     border: 1px solid #c9ddec;
-    transition: transform 0.18s cubic-bezier(0.16, 1, 0.3, 1), box-shadow 0.18s cubic-bezier(0.16, 1, 0.3, 1), border-color 0.18s ease;
-    position: relative;
+    background: #edf4f8;
+    touch-action: manipulation;
     user-select: none;
+    -webkit-tap-highlight-color: transparent;
+    outline: none;
+    transition: background 0.12s ease, box-shadow 0.12s ease, border-color 0.12s ease;
 }
 
-.mini-gauge-container-clickable:hover {
-    transform: translateY(-2px);
-    box-shadow: 0 6px 18px rgba(7, 83, 127, 0.14);
+.mini-gauge-container-clickable *,
+.mini-gauge-container-clickable .mini-gauge-graph,
+.mini-gauge-container-clickable .js-plotly-plot,
+.mini-gauge-container-clickable .plot-container,
+.mini-gauge-container-clickable .svg-container,
+.mini-gauge-container-clickable svg {
+    pointer-events: none !important;
+    cursor: pointer !important;
+    user-select: none !important;
+}
+
+.mini-gauge-container-clickable:hover,
+.mini-gauge-container-clickable:focus-visible {
+    background: #e4f0f8;
     border-color: #075a86;
-    background: #e6f0f7;
+    box-shadow: 0 4px 14px rgba(7, 83, 127, 0.15), inset 0 0 0 1px rgba(7, 90, 134, 0.2);
+    outline: none;
 }
 
 .mini-gauge-container-clickable:active,
 .mini-gauge-container-clickable.card-clicking {
-    background: #ddebf5 !important;
+    background: #d6e8f5 !important;
     border-color: #075a86 !important;
-    box-shadow: 0 0 0 3px rgba(7, 90, 134, 0.3), 0 2px 8px rgba(7, 90, 134, 0.2) !important;
-    transition: background 0.1s ease, box-shadow 0.1s ease !important;
+    box-shadow: 0 0 0 3px rgba(7, 90, 134, 0.3), inset 0 1px 3px rgba(7, 90, 134, 0.18) !important;
+    transition: background 0.08s ease, box-shadow 0.08s ease !important;
 }
 
 .function-gauge-modal {
