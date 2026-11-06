@@ -1755,7 +1755,14 @@ def create_mini_gauge_svg_uri(value):
     clamped = max(0.0, min(100.0, numeric_value))
     gauge_color = "#dce7ef" if is_no_data else ("#168b69" if numeric_value >= GAUGE_TARGET else "#dc3d56")
 
-    cx, cy, r = 115.0, 108.0, 68.0
+    # Matches Plotly go.Indicator(mode="gauge") proportions:
+    # Track thickness = 20 (R_in=68, R_out=88, mid R=78)
+    # Bar thickness = 0.52 * 20 = 10.4 centered in track
+    # Threshold thickness = 0.85 * 20 = 17 (r=69.5 to r=86.5)
+    cx, cy, r = 125.0, 114.0, 78.0
+    track_w = 20.0
+    bar_w = 10.4
+    r_out = r + track_w / 2.0  # 88.0
     x_start, y_start = cx - r, cy
     x_full, y_full = cx + r, cy
 
@@ -1769,38 +1776,44 @@ def create_mini_gauge_svg_uri(value):
             y_end = cy - r * math.sin(ang)
         active_arc = (
             f'<path d="M {x_start:.2f} {y_start:.2f} A {r:.2f} {r:.2f} 0 0 1 {x_end:.2f} {y_end:.2f}" '
-            f'fill="none" stroke="{gauge_color}" stroke-width="22" stroke-linecap="butt"/>'
+            f'fill="none" stroke="{gauge_color}" stroke-width="{bar_w:.1f}" stroke-linecap="butt"/>'
         )
 
     t_ang = math.radians(180.0 - (GAUGE_TARGET / 100.0) * 180.0)
-    tx1 = cx + 54.0 * math.cos(t_ang)
-    ty1 = cy - 54.0 * math.sin(t_ang)
-    tx2 = cx + 82.0 * math.cos(t_ang)
-    ty2 = cy - 82.0 * math.sin(t_ang)
+    t_half = (track_w * 0.85) / 2.0  # 8.5
+    tx1 = cx + (r - t_half) * math.cos(t_ang)
+    ty1 = cy - (r - t_half) * math.sin(t_ang)
+    tx2 = cx + (r + t_half) * math.cos(t_ang)
+    ty2 = cy - (r + t_half) * math.sin(t_ang)
 
-    tk1_x = cx + 80.5 * math.cos(t_ang)
-    tk1_y = cy - 80.5 * math.sin(t_ang)
-    tk2_x = cx + 84.5 * math.cos(t_ang)
-    tk2_y = cy - 84.5 * math.sin(t_ang)
-    lbl_x = cx + 87.0 * math.cos(t_ang)
-    lbl_y = cy - 87.0 * math.sin(t_ang) + 3.0
+    tk1_x = cx + r_out * math.cos(t_ang)
+    tk1_y = cy - r_out * math.sin(t_ang)
+    tk2_x = cx + (r_out + 3.0) * math.cos(t_ang)
+    tk2_y = cy - (r_out + 3.0) * math.sin(t_ang)
+    lbl_x = cx + (r_out + 5.0) * math.cos(t_ang)
+    lbl_y = cy - (r_out + 5.0) * math.sin(t_ang) + 2.5
+
+    left_tk1 = cx - r_out
+    left_tk2 = left_tk1 - 3.0
+    right_tk1 = cx + r_out
+    right_tk2 = right_tk1 + 3.0
 
     val_text = "—" if is_no_data else format_percentage(value)
 
     svg = (
-        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 230 132" width="100%" height="140">'
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 250 136" width="100%" height="140">'
         f'<path d="M {x_start:.2f} {y_start:.2f} A {r:.2f} {r:.2f} 0 0 1 {x_full:.2f} {y_full:.2f}" '
-        'fill="none" stroke="#dce7ef" stroke-width="22" stroke-linecap="butt"/>'
+        f'fill="none" stroke="#dce7ef" stroke-width="{track_w:.1f}" stroke-linecap="butt"/>'
         f'{active_arc}'
-        f'<line x1="{tx1:.2f}" y1="{ty1:.2f}" x2="{tx2:.2f}" y2="{ty2:.2f}" stroke="#0877b9" stroke-width="3"/>'
-        f'<line x1="36" y1="{cy:.0f}" x2="32" y2="{cy:.0f}" stroke="#000000" stroke-width="1"/>'
-        f'<text x="30" y="{cy + 3:.0f}" text-anchor="end" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#000000">0%</text>'
-        f'<line x1="194" y1="{cy:.0f}" x2="198" y2="{cy:.0f}" stroke="#000000" stroke-width="1"/>'
-        f'<text x="200" y="{cy + 3:.0f}" text-anchor="start" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#000000">100%</text>'
+        f'<line x1="{tx1:.2f}" y1="{ty1:.2f}" x2="{tx2:.2f}" y2="{ty2:.2f}" stroke="#0877b9" stroke-width="2.8"/>'
+        f'<line x1="{left_tk1:.1f}" y1="{cy:.0f}" x2="{left_tk2:.1f}" y2="{cy:.0f}" stroke="#000000" stroke-width="1"/>'
+        f'<text x="{left_tk2 - 2.0:.1f}" y="{cy + 3:.0f}" text-anchor="end" font-family="Segoe UI, Arial, sans-serif" font-size="9.5" fill="#000000">0%</text>'
+        f'<line x1="{right_tk1:.1f}" y1="{cy:.0f}" x2="{right_tk2:.1f}" y2="{cy:.0f}" stroke="#000000" stroke-width="1"/>'
+        f'<text x="{right_tk2 + 2.0:.1f}" y="{cy + 3:.0f}" text-anchor="start" font-family="Segoe UI, Arial, sans-serif" font-size="9.5" fill="#000000">100%</text>'
         f'<line x1="{tk1_x:.2f}" y1="{tk1_y:.2f}" x2="{tk2_x:.2f}" y2="{tk2_y:.2f}" stroke="#000000" stroke-width="1"/>'
-        f'<text x="{lbl_x:.2f}" y="{lbl_y:.2f}" text-anchor="start" font-family="Segoe UI, Arial, sans-serif" font-size="10" fill="#000000">{GAUGE_TARGET}%</text>'
-        f'<text x="{cx:.0f}" y="89" text-anchor="middle" font-family="Segoe UI, Arial, sans-serif" font-size="26" font-weight="700" fill="#000000">{val_text}</text>'
-        f'<text x="{cx:.0f}" y="110" text-anchor="middle" font-family="Segoe UI, Arial, sans-serif" font-size="11" fill="#000000">met &amp; improved</text>'
+        f'<text x="{lbl_x:.2f}" y="{lbl_y:.2f}" text-anchor="start" font-family="Segoe UI, Arial, sans-serif" font-size="9.5" fill="#000000">{GAUGE_TARGET}%</text>'
+        f'<text x="{cx:.0f}" y="92" text-anchor="middle" font-family="Segoe UI, Arial, sans-serif" font-size="26" font-weight="700" fill="#000000">{val_text}</text>'
+        f'<text x="{cx:.0f}" y="113" text-anchor="middle" font-family="Segoe UI, Arial, sans-serif" font-size="11" fill="#000000">met &amp; improved</text>'
         '</svg>'
     )
     return "data:image/svg+xml;utf8," + urllib.parse.quote(svg)
